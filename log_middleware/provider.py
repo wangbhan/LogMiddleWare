@@ -26,6 +26,7 @@ def setup_provider(config: "TraceConfig") -> TracerProvider:
     trace.set_tracer_provider(provider)
     set_global_textmap(CompositePropagator([TraceContextTextMapPropagator()]))
 
+    # 添加自动将 traceparent 注入到调用外部接口的请求头中
     if config.auto_instrument_aiohttp:
         try:
             from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
