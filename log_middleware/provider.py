@@ -23,6 +23,15 @@ def setup_provider(config: "TraceConfig") -> TracerProvider:
     trace.set_tracer_provider(provider)
     set_global_textmap(CompositePropagator([TraceContextTextMapPropagator()]))
 
+    if config.auto_instrument_aiohttp:
+        try:
+            from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
+            instrumentor = AioHttpClientInstrumentor()
+            if not instrumentor.is_instrumented_by_opentelemetry:
+                instrumentor.instrument()
+        except ImportError:
+            pass
+
     _provider = provider
     return provider
 
