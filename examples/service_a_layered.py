@@ -68,9 +68,25 @@ class UserService:
         return {"local_users": local_users, "remote_items": remote_items}
 
 
+# ─── 可选演示：各层使用子 Span 增加链路粒度 ──────────────────────────────────
+# 取消注释以下代码，可以看到每层有独立的 span_id（但 trace_id 仍相同）
+#
+class UserServiceWithSpans:
+    def __init__(self):
+        self._repo = UserRepository()
+
+    async def get_users(self):
+        with tracer.start_as_current_span("UserService.get_users") as span:
+            svc_logger.info("[service+span] 开始聚合（span_id 是子 span）")
+            local_users = await self._repo.find_all()
+            span.set_attribute("local_user_count", len(local_users))
+            return {"local_users": local_users}
+
 # ─── Controller 层（Sanic 路由 handler）──────────────────────────────────────
 _service = UserService()
 
+
+_test = UserServiceWithSpans()
 
 @app.get("/api/users")
 async def get_users(request):
@@ -79,21 +95,13 @@ async def get_users(request):
     ctrl_logger.info("[controller] 响应准备完成，返回给客户端")
     return sanic.response.json(result)
 
+@app.get("/api/test")
+async def test(request):
+    ctrl_logger.info("[controller] 收到 GET /api/test 请求")
+    result = await _test.get_users()
+    ctrl_logger.info("[controller] 响应准备完成，返回给客户端")
+    return sanic.response.json(result)
 
-# ─── 可选演示：各层使用子 Span 增加链路粒度 ──────────────────────────────────
-# 取消注释以下代码，可以看到每层有独立的 span_id（但 trace_id 仍相同）
-#
-# class UserServiceWithSpans:
-#     def __init__(self):
-#         self._repo = UserRepository()
-#
-#     async def get_users(self):
-#         with tracer.start_as_current_span("UserService.get_users") as span:
-#             svc_logger.info("[service+span] 开始聚合（span_id 是子 span）")
-#             local_users = await self._repo.find_all()
-#             span.set_attribute("local_user_count", len(local_users))
-#             ...
-#             return ...
 
 
 if __name__ == "__main__":
