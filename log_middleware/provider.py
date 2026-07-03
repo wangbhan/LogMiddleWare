@@ -13,7 +13,10 @@ def setup_provider(config: "TraceConfig") -> TracerProvider:
     if _provider is not None:
         return _provider
 
-    resource = Resource.create({"service.name": config.service_name})
+    resource = Resource(attributes={
+        "service.name": config.service_name,
+        **config.resource_attributes,
+    })
     provider = TracerProvider(resource=resource)
 
     from .exporters import build_processors

@@ -16,7 +16,15 @@ class SanicTraceMiddleware:
 
     def __init__(self, app, service_name: str = "unknown-service", config: TraceConfig | None = None):
         if config is None:
-            config = TraceConfig(service_name=service_name)
+            config = TraceConfig(
+                service_name=service_name,
+                resource_attributes={
+                    "vx_trace.name": "vx_trace",
+                    "vx_trace.sdk.name": "LogMiddleWare",
+                    "vx_trace.sdk.version": "0.0.1",
+                    "vx_trace.sdk.language": "python",
+                }
+            )
         else:
             config.service_name = service_name
 
