@@ -1,0 +1,12 @@
+[project]
+name = "logmiddleware"
+version = "0.1.0"
+description = "OpenTelemetry 全链路追踪日志中间件 SDK for Sanic"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "aiohttp>=3.14.1",
+    "opentelemetry-api>=1.43.0",
+    "opentelemetry-sdk>=1.43.0",
+    "sanic>=25.12.1",
+]
