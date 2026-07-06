@@ -13,6 +13,7 @@
 - **跨服务链路传播**：基于 W3C TraceContext 标准，多个服务共享同一 `trace_id`
 - **aiohttp 自动拦截**：出站 HTTP 请求自动注入 `traceparent` 头，无需手动调用
 - **分层架构透明**：asyncio ContextVar 机制保证 controller → service → repository 全链路透传
+- **日志落盘**：支持将带 trace 字段的日志文本写入文件，内置按大小自动轮转，目录不存在时自动创建
 - **自定义 Resource**：支持自定义 Span 的 resource 属性（服务版本、环境、自定义标签等）
 - **可配置导出**：支持控制台、文件、不导出等多种 Span 导出方式
 
@@ -167,8 +168,13 @@ config = TraceConfig(
     # Span 导出方式："none"（不导出）| "console"（打印 JSON）| "file"（写文件）| "both"
     exporter_type="none",
 
-    # exporter_type 为 "file" 或 "both" 时指定输出路径
+    # exporter_type 为 "file" 或 "both" 时指定 Span JSONL 输出路径
     log_file_path="/var/log/spans.jsonl",
+
+    # 日志文本落盘：指定路径后，带 trace_id 的日志同时写入文件（目录不存在时自动创建）
+    log_output_path="logs/my-service.log",
+    log_max_bytes=10 * 1024 * 1024,  # 单文件上限，默认 10 MB
+    log_backup_count=5,              # 保留旧文件数，默认 5 个
 
     # 是否自动拦截 aiohttp 出站请求（默认 True）
     auto_instrument_aiohttp=True,
