@@ -10,11 +10,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from sanic import Sanic
 import sanic.response
-from log_middleware import SanicTraceMiddleware, setup_trace_logging
+from log_middleware import SanicTraceMiddleware, setup_trace_logging, TraceConfig
 
 app = Sanic("service-b")
 SanicTraceMiddleware(app, service_name="service-b")
-setup_trace_logging()
+config = TraceConfig(
+    log_output_path="./logs/service-b.log"
+)
+setup_trace_logging(config)
 
 logger = logging.getLogger("service-b")
 

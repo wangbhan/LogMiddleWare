@@ -21,11 +21,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from sanic import Sanic
 import sanic.response
-from log_middleware import SanicTraceMiddleware, setup_trace_logging, get_tracer
+from log_middleware import SanicTraceMiddleware, setup_trace_logging, get_tracer, TraceConfig
 
 app = Sanic("service-a-layered")
 SanicTraceMiddleware(app, service_name="service-a-layered")
-setup_trace_logging()
+config = TraceConfig(
+    log_output_path="./logs/service-a-layered.log"
+)
+setup_trace_logging(config)
 
 # 各层使用独立的 logger name，方便区分日志来源，trace_id 仍然相同
 repo_logger = logging.getLogger("service-a.repository")

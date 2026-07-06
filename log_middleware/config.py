@@ -5,7 +5,10 @@ from dataclasses import dataclass, field
 class TraceConfig:
     service_name: str = "unknown-service"
     exporter_type: str = "otlp"  # "none" | "console" | "file" | "both" ｜ "otlp"
-    log_file_path: str | None = None
+    log_file_path: str | None = None         # 导出span的jsonl使用
+    log_output_path: str | None = None       # 日志文本落盘路径，None 表示不写文件
+    log_max_bytes: int = 10 * 1024 * 1024    # 单文件上限，默认 10 MB
+    log_backup_count: int = 5                # 保留旧文件数，默认 5 个
     processor_type: str = "simple"  # "simple" | "batch"
     auto_instrument_aiohttp: bool = True  # 自动拦截 aiohttp 出站请求，无需手动 inject headers
     resource_attributes: dict = field(default_factory=dict)  # 自定义 resource 属性，合并到 Span 的 resource 块

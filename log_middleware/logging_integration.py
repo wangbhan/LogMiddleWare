@@ -1,4 +1,6 @@
 import logging
+import logging.handlers
+import os
 from opentelemetry import trace
 from opentelemetry.trace import format_trace_id, format_span_id
 
@@ -58,11 +60,13 @@ def setup_trace_logging(
         logger = logging.getLogger(name)
         logger.setLevel(config.log_level)
 
-        # 将 filter 挂在 handler 上（而非 logger），保证子 logger 通过传播到达 root handler
-        # 时也能正确注入 trace_id 等字段，避免 KeyError
-        existing = [h for h in logger.handlers if isinstance(h, logging.StreamHandler)]
-        if existing:
-            for h in existing:
+        # type() 精确匹配，排除 RotatingFileHandler（它继承自 StreamHandler）
+        existing_stream = [h for h in logger.handlers if type(h) is logging.StreamHandler]
+        existing_file = [h for h in logger.handlers if isinstance(h, logging.handlers.RotatingFileHandler)]
+
+        if existing_stream:
+            for h in existing_stream:
+                h.setFormatter(formatter)
                 if not any(isinstance(f, TraceContextFilter) for f in h.filters):
                     h.addFilter(filter_)
         else:
@@ -70,3 +74,15 @@ def setup_trace_logging(
             handler.setFormatter(formatter)
             handler.addFilter(filter_)
             logger.addHandler(handler)
+
+        if config.log_output_path and not existing_file:
+            os.makedirs(os.path.dirname(os.path.abspath(config.log_output_path)), exist_ok=True)
+            file_handler = logging.handlers.RotatingFileHandler(
+                filename=config.log_output_path,
+                maxBytes=config.log_max_bytes,
+                backupCount=config.log_backup_count,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(formatter)
+            file_handler.addFilter(filter_)
+            logger.addHandler(file_handler)
