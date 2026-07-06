@@ -1,3 +1,5 @@
+__version__ = "0.1.0"
+
 from .middleware import SanicTraceMiddleware
 from .logging_integration import setup_trace_logging, TraceContextFilter
 from .config import TraceConfig

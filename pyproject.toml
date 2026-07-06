@@ -1,9 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
-name = "logmiddleware"
+name = "log-middleware"
 version = "0.1.0"
 description = "OpenTelemetry 全链路追踪日志中间件 SDK for Sanic"
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.14"
+keywords = ["opentelemetry", "tracing", "logging", "sanic", "middleware"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Framework :: AsyncIO",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Logging",
+]
 dependencies = [
     "aiohttp>=3.14.1",
     "opentelemetry-api>=1.43.0",
@@ -12,3 +27,13 @@ dependencies = [
     "opentelemetry-sdk>=1.43.0",
     "sanic>=25.12.1",
 ]
+
+[project.optional-dependencies]
+# 仅需日志注入，不需要 Sanic/aiohttp 的轻量场景
+minimal = [
+    "opentelemetry-api>=1.43.0",
+    "opentelemetry-sdk>=1.43.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["log_middleware"]

@@ -21,7 +21,7 @@ class SanicTraceMiddleware:
                 resource_attributes={
                     "vx_trace.name": "vx_trace",
                     "vx_trace.sdk.name": "LogMiddleWare",
-                    "vx_trace.sdk.version": "0.0.1",
+                    "vx_trace.sdk.version": "0.1.0",
                     "vx_trace.sdk.language": "python",
                 }
             )
