@@ -16,3 +16,4 @@ class TraceConfig:
         "[%(name)s] %(message)s"
     )
     log_level: int = 10  # logging.DEBUG
+    baggage_keys: list[str] = field(default_factory=list)  # 第二阶段启用，需透传的业务字段名，如 ["user_id", "tenant_id"]

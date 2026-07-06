@@ -2,6 +2,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.baggage.propagation import W3CBaggagePropagator
 from opentelemetry.propagators.composite import CompositePropagator
 from opentelemetry.propagate import set_global_textmap
 
@@ -24,7 +25,7 @@ def setup_provider(config: "TraceConfig") -> TracerProvider:
         provider.add_span_processor(processor)
 
     trace.set_tracer_provider(provider)
-    set_global_textmap(CompositePropagator([TraceContextTextMapPropagator()]))
+    set_global_textmap(CompositePropagator([TraceContextTextMapPropagator(), W3CBaggagePropagator()]))
 
     # 添加自动将 traceparent 注入到调用外部接口的请求头中
     if config.auto_instrument_aiohttp:

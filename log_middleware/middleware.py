@@ -1,9 +1,13 @@
+import logging
+
 from opentelemetry import trace, context as context_api
 from opentelemetry.trace import SpanKind, StatusCode
 
 from .config import TraceConfig
 from .provider import setup_provider
 from .propagation import extract_trace_context
+
+_logger = logging.getLogger(__name__)
 
 
 class SanicTraceMiddleware:
@@ -35,6 +39,10 @@ class SanicTraceMiddleware:
         app.register_middleware(self._after_response, "response")
 
     async def _before_request(self, request):
+        traceparent = request.headers.get("traceparent")
+        if traceparent:
+            _logger.debug("收到上游 traceparent: %s", traceparent)
+
         # 从入站请求头提取父上下文（跨服务传播的 traceparent）
         parent_ctx = extract_trace_context(request)
 
@@ -69,6 +77,9 @@ class SanicTraceMiddleware:
                     span.set_status(StatusCode.ERROR)
                 else:
                     span.set_status(StatusCode.OK)
+                ctx = span.get_span_context()
+                if ctx.is_valid:
+                    response.headers["X-Trace-Id"] = trace.format_trace_id(ctx.trace_id)
             span.end()
 
         if token is not None:

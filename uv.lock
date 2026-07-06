@@ -243,9 +243,9 @@ wheels = [
 ]
 
 [[package]]
-name = "logmiddleware"
+name = "log-middleware"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "opentelemetry-api" },
@@ -255,15 +255,24 @@ dependencies = [
     { name = "sanic" },
 ]
 
+[package.optional-dependencies]
+minimal = [
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-sdk" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.1" },
     { name = "opentelemetry-api", specifier = ">=1.43.0" },
+    { name = "opentelemetry-api", marker = "extra == 'minimal'", specifier = ">=1.43.0" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.43.0" },
     { name = "opentelemetry-instrumentation-aiohttp-client", specifier = ">=0.64b0" },
     { name = "opentelemetry-sdk", specifier = ">=1.43.0" },
+    { name = "opentelemetry-sdk", marker = "extra == 'minimal'", specifier = ">=1.43.0" },
     { name = "sanic", specifier = ">=25.12.1" },
 ]
+provides-extras = ["minimal"]
 
 [[package]]
 name = "multidict"
