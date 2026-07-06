@@ -25,9 +25,11 @@ class FileSpanExporter(SpanExporter):
 
 def build_processors(config: "TraceConfig") -> list:
     """根据配置返回 SpanProcessor 列表。"""
-    from .config import TraceConfig
-
-    Processor = SimpleSpanProcessor if config.processor_type == "simple" else BatchSpanProcessor
+    # otlp 导出用 BatchSpanProcessor 以减少网络开销，其余遵循 processor_type 配置
+    def make_processor(exporter):
+        if config.exporter_type == "otlp" or config.processor_type == "batch":
+            return BatchSpanProcessor(exporter)
+        return SimpleSpanProcessor(exporter)
 
     exporters = []
     if config.exporter_type in ("console", "both"):
@@ -36,5 +38,8 @@ def build_processors(config: "TraceConfig") -> list:
         if not config.log_file_path:
             raise ValueError("exporter_type 为 'file' 或 'both' 时必须设置 log_file_path")
         exporters.append(FileSpanExporter(config.log_file_path))
+    if config.exporter_type == "otlp":
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        exporters.append(OTLPSpanExporter(endpoint=f"{config.otlp_endpoint}/v1/traces"))
 
-    return [Processor(exp) for exp in exporters]
+    return [make_processor(exp) for exp in exporters]
