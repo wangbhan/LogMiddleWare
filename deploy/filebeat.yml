@@ -1,0 +1,59 @@
+filebeat.inputs:
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/app/*.log
+    # 多行合并：以 [ 开头的行是新日志，其余行（如异常堆栈）合并到上一条
+    multiline.pattern: '^\['
+    multiline.negate: true
+    multiline.match: after
+
+processors:
+  - dissect:
+      # 解析 SDK 默认日志格式：
+      # [2026-07-07 10:23:45,123] INFO [trace_id=xxx span_id=yyy parent_span_id=zzz] [logger] message
+      tokenizer: '[%{ts}] %{level} [trace_id=%{trace_id} span_id=%{span_id} parent_span_id=%{parent_span_id}] [%{logger}] %{message}'
+      field: message
+      target_prefix: ""
+      overwrite_keys: true
+      ignore_failure: true   # 解析失败时保留原始 message，不丢弃日志
+
+  - timestamp:
+      field: ts
+      layouts:
+        - '2006-01-02 15:04:05,999'
+      test:
+        - '2026-07-07 10:23:45,123'
+      ignore_failure: true
+
+  - drop_fields:
+      fields: ["log", "agent", "ecs", "input", "host"]
+      ignore_missing: true
+
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  index: "logs-%{+yyyy.MM.dd}"
+
+setup.ilm.enabled: false
+setup.template.name: "logs"
+setup.template.pattern: "logs-*"
+setup.template.overwrite: true
+setup.template.settings:
+  index.number_of_shards: 1
+  index.number_of_replicas: 0
+setup.template.fields: ""
+setup.template.append_fields:
+  - name: trace_id
+    type: keyword
+  - name: span_id
+    type: keyword
+  - name: parent_span_id
+    type: keyword
+  - name: level
+    type: keyword
+  - name: logger
+    type: keyword
+  - name: ts
+    type: keyword
+
+logging.level: warning

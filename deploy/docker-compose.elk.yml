@@ -1,0 +1,63 @@
+# ELK 日志存储栈：Elasticsearch + Kibana + Filebeat
+#
+# 用法：
+#   启动：
+#     docker compose -f deploy/docker-compose.elk.yml up -d
+#
+#   可与 docker-compose.tempo.yml 同时运行（端口不冲突）
+#
+#   Kibana UI：http://localhost:5601
+#   ES API：   http://localhost:9200
+#
+#   停止：
+#     docker compose -f deploy/docker-compose.elk.yml down
+#
+# 注意：ES + Kibana 建议宿主机内存 >= 4GB
+
+services:
+  elasticsearch:
+    image: elasticsearch:8.13.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false      # 开发环境关闭认证
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m   # 按实际内存调整
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\\|yellow\"'"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  kibana:
+    image: kibana:8.13.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - I18N_LOCALE=zh-CN                # Kibana 界面中文
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  filebeat:
+    image: elastic/filebeat:8.13.0
+    container_name: filebeat
+    user: root                            # 需要 root 读取宿主机日志文件
+    command: ["filebeat", "-e", "-strict.perms=false"]
+    volumes:
+      - ./filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ../logs:/var/log/app:ro           # 挂载 SDK 写出的日志目录
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  es_data:
