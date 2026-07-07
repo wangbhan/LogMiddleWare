@@ -39,14 +39,20 @@ pip install logmiddleware
 import logging
 from sanic import Sanic
 import sanic.response
-from log_middleware import SanicTraceMiddleware, setup_trace_logging
+from log_middleware import SanicTraceMiddleware, setup_trace_logging, TraceConfig
 
 app = Sanic("my-service")
 
 # 1. 注册追踪中间件
 SanicTraceMiddleware(app, service_name="my-service")
 
-# 2. 配置日志格式（自动注入 trace 字段）
+# 2. 配置对应文件
+config = TraceConfig(
+    log_file_path="logs/service.jsonl",
+    log_output_path="logs/service.log"
+)
+
+# 3. 配置日志格式（自动注入 trace 字段）
 setup_trace_logging()
 
 logger = logging.getLogger("my-service")
