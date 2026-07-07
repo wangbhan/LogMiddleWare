@@ -53,7 +53,7 @@ config = TraceConfig(
 )
 
 # 3. 配置日志格式（自动注入 trace 字段）
-setup_trace_logging()
+setup_trace_logging(config)
 
 logger = logging.getLogger("my-service")
 
