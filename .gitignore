@@ -8,6 +8,8 @@ wheels/
 
 log/
 
+logs/
+
 docs
 
 # Virtual environments
