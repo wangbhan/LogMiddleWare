@@ -32,11 +32,16 @@ class SanicTraceMiddleware:
         else:
             config.service_name = service_name
 
-        setup_provider(config)
+        self._provider = setup_provider(config)
         self._tracer = trace.get_tracer(__name__)
 
         app.register_middleware(self._before_request, "request")
         app.register_middleware(self._after_response, "response")
+
+        @app.before_server_stop
+        async def _flush_spans(app, loop):
+            self._provider.force_flush(timeout_millis=5000)
+            self._provider.shutdown()
 
     async def _before_request(self, request):
         traceparent = request.headers.get("traceparent")
