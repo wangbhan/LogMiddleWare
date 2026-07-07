@@ -8,5 +8,7 @@ wheels/
 
 log/
 
+docs
+
 # Virtual environments
 .venv
