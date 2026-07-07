@@ -1,0 +1,50 @@
+# Grafana Tempo + Grafana 链路追踪栈
+#
+# 用法：
+#   启动前先停止 Jaeger（端口冲突，两套 compose 不能同时运行）：
+#     docker compose -f deploy/docker-compose.yml down
+#
+#   启动：
+#     docker compose -f deploy/docker-compose.tempo.yml up -d
+#
+#   Grafana UI：http://localhost:3000
+#     → Explore → 选 Tempo 数据源 → 搜索 service name 查看 trace
+#
+#   停止：
+#     docker compose -f deploy/docker-compose.tempo.yml down
+
+services:
+  tempo:
+    image: grafana/tempo:2.5.0
+    container_name: tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml
+      - tempo_data:/var/tempo
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP（SDK 默认使用此端口）
+      - "3200:3200"   # Tempo HTTP API（Grafana 查询用）
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
+    ports:
+      - "3000:3000"   # Grafana UI
+    depends_on:
+      - tempo
+    restart: unless-stopped
+
+volumes:
+  tempo_data:
+  grafana_data:
