@@ -16,6 +16,7 @@
 - **日志落盘**：支持将带 trace 字段的日志文本写入文件，内置按大小自动轮转，目录不存在时自动创建
 - **自定义 Resource**：支持自定义 Span 的 resource 属性（服务版本、环境、自定义标签等）
 - **可配置导出**：支持控制台、文件、不导出等多种 Span 导出方式
+- **零值日志优化**：自动将启动服务时的零值trace转换为空字符串，配合Filebeat实现ES存储优化
 
 ---
 
@@ -70,6 +71,72 @@ if __name__ == "__main__":
 ```
 [2026-07-03 16:34:37,493] INFO [trace_id=7b2ae787... span_id=4ed03c7a... parent_span_id=0000...] [my-service] 处理请求
 ```
+
+---
+
+## 零值日志处理与ES优化
+
+### 问题背景
+
+在服务启动时，由于没有HTTP请求上下文，OpenTelemetry的trace context无效，导致日志中的trace字段被填充为零值：
+- `trace_id`: 32个零字符（`00000000000000000000000000000000`）
+- `span_id`: 16个零字符（`0000000000000000`）
+- `parent_span_id`: 16个零字符
+
+这些零值日志约占总体日志的70%，对Elasticsearch存储和检索都无意义。
+
+### 解决方案
+
+本SDK采用**生成端转换 + 采集端过滤**的组合方案：
+
+#### 1. 日志生成端（SDK自动处理）
+
+SDK的`TraceContextFilter`会自动将零值trace字段转换为空字符串：
+
+```python
+# 启动日志（无trace上下文）
+[2026-07-08 10:22:43,015] INFO [trace_id= span_id= parent_span_id=] [sanic.root] Sanic v25.12.1
+
+# 业务日志（有trace上下文）
+[2026-07-08 10:23:45,123] INFO [trace_id=4bf92f35... span_id=00f067aa... parent_span_id=0000...] [my-service] 处理请求
+```
+
+**实现机制**：当检测到trace context无效时，SDK将trace字段设置为空字符串而不是零值。
+
+#### 2. Filebeat采集端（用户配置）
+
+通过Filebeat的条件过滤，只将有效的业务日志采集到ES：
+
+```yaml
+processors:
+  # 解析日志格式
+  - dissect:
+      tokenizer: '[%{ts}] %{level} [trace_id=%{trace_id} span_id=%{span_id} parent_span_id=%{parent_span_id}] [%{logger}] %{message}'
+      field: message
+      target_prefix: ""
+      overwrite_keys: true
+      ignore_failure: true
+
+  # 只有当trace字段中任意一个有值时才采集到ES
+  - drop_event:
+      when:
+        and:
+          - equals:
+              trace_id: ""
+          - equals:
+              span_id: ""
+          - equals:
+              parent_span_id: ""
+```
+
+**过滤逻辑**：当三个trace字段都为空时，丢弃该日志事件，不采集到ES。
+
+### 优势效果
+
+- **本地日志完整**: 所有日志（包括启动日志）都保存在本地文件，便于调试和审计
+- **ES存储优化**: 只有包含业务trace信息的日志存入ES，节省约70%存储空间
+- **查询效率**: ES中的日志都是有效的业务追踪日志，提升查询性能
+- **维护简单**: 配置清晰，逻辑分离，便于维护和调试
 
 ---
 
@@ -192,6 +259,7 @@ config = TraceConfig(
     },
 
     # 日志格式（标准 Python logging 格式字符串）
+    # 注意：启动时的零值trace会自动转换为空字符串，便于ES采集端过滤
     log_format=(
         "[%(asctime)s] %(levelname)s "
         "[trace_id=%(trace_id)s span_id=%(span_id)s parent_span_id=%(parent_span_id)s] "
