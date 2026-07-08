@@ -57,6 +57,7 @@ def setup_trace_logging(
     targets = logger_names if logger_names is not None else [None]
 
     for name in targets:
+        # name为None传给getLogger()是root配置，即全局日志都按这个标准配置
         logger = logging.getLogger(name)
         logger.setLevel(config.log_level)
 
