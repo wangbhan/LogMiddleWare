@@ -26,6 +26,17 @@ processors:
         - '2026-07-07 10:23:45,123'
       ignore_failure: true
 
+  # 只有当trace字段中任意一个有值时才采集到ES（过滤掉启动时的零值trace日志）
+  - drop_event:
+      when:
+        and:
+          - equals:
+              trace_id: ""
+          - equals:
+              span_id: ""
+          - equals:
+              parent_span_id: ""
+
   - drop_fields:
       fields: ["log", "agent", "ecs", "input", "host"]
       ignore_missing: true
@@ -55,5 +66,8 @@ setup.template.append_fields:
     type: keyword
   - name: ts
     type: keyword
+
+# 禁用 data stream，使用传统 index 模式（Filebeat 8.x+ 默认启用 data stream）
+setup.template.datasets.enabled: false
 
 logging.level: warning

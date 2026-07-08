@@ -6,14 +6,13 @@ from opentelemetry.trace import format_trace_id, format_span_id
 
 from .config import TraceConfig
 
-_ZERO_TRACE_ID = "0" * 32
-_ZERO_SPAN_ID = "0" * 16
-
 
 class TraceContextFilter(logging.Filter):
     """
     向每条 LogRecord 自动注入 trace_id、span_id、parent_span_id。
     通过 contextvars 读取当前 asyncio Task 的活跃 Span，异步环境下天然隔离。
+
+    新增功能：将零值trace字段转换为空字符串，便于在Filebeat中进行条件过滤。
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -24,15 +23,16 @@ class TraceContextFilter(logging.Filter):
             record.trace_id = format_trace_id(ctx.trace_id)
             record.span_id = format_span_id(ctx.span_id)
         else:
-            record.trace_id = _ZERO_TRACE_ID
-            record.span_id = _ZERO_SPAN_ID
+            # 将零值改为空字符串，便于后续在Filebeat中进行条件过滤
+            record.trace_id = ""
+            record.span_id = ""
 
         # _parent 是 OTel SDK 的内部属性（ReadableSpan），用 getattr 防护
         parent = getattr(span, "_parent", None)
         if parent is not None and parent.is_valid:
             record.parent_span_id = format_span_id(parent.span_id)
         else:
-            record.parent_span_id = _ZERO_SPAN_ID
+            record.parent_span_id = ""
 
         return True
 
