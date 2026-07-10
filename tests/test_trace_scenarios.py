@@ -744,44 +744,196 @@ async def test_create_task_inside_active_context():
     )
 
 
-async def test_run_in_executor_needs_helper():
+async def test_run_in_executor_transparent_after_patch():
     """
-    场景16: loop.run_in_executor() 到线程池 —— 线程独立 ContextVar 命名空间
-    原理: 线程有自己的 ContextVar 存储，asyncio Task 的 ContextVar 不会自动跨线程
-    预期: 未处理 → 无 trace_id（已知限制）；使用 helper 包装 → 有 trace_id
-    """
-    from log_middleware import run_in_thread
+    场景16: SDK 全局 patch BaseEventLoop.run_in_executor 后，用户零改动
+    → 原生 `loop.run_in_executor(None, sync_fn)` 在线程内也自动有 trace_id。
 
+    原理: patch 后自动 `contextvars.copy_context()` 快照当前 asyncio Task 的
+         ContextVar，并用 `ctx.run(fn, *args)` 在线程内恢复。
+
+    调用前需触发 patch（`run_all()` 会在 Group 6 之前调用 _patch_run_in_executor_once）
+    """
     _, tracer, logger, capture = make_test_env()
 
-    unwrapped_fields: dict = {}
-    wrapped_fields: dict = {}
+    thread_fields: dict = {}
 
-    def sync_worker(label, target_dict):
-        logger.info(f"[thread:{label}] running")
-        target_dict.update(capture.get_trace_fields(-1))
+    def sync_worker():
+        logger.info("[thread] 同步 LLM 调用")
+        thread_fields.update(capture.get_trace_fields(-1))
+        return "LLM response"
 
-    span = tracer.start_span("POST /api/sync")
+    span = tracer.start_span("POST /api/sync-llm")
     ctx = trace.set_span_in_context(span)
     token = context_api.attach(ctx)
     try:
         loop = asyncio.get_event_loop()
-        # A. 原生 run_in_executor —— 线程内无 trace（BUG）
-        await loop.run_in_executor(None, sync_worker, "raw", unwrapped_fields)
-        # B. 用 SDK 提供的 helper —— 线程内有 trace（修复）
-        # await run_in_thread(sync_worker, "wrapped", wrapped_fields)
+        # 用户完全不需要改动，直接用原生 run_in_executor
+        await loop.run_in_executor(None, sync_worker)
     finally:
         span.end()
         context_api.detach(token)
 
-    raw_empty = not has_trace(unwrapped_fields)
-    wrapped_ok = has_trace(wrapped_fields)
     report(
-        "test_run_in_executor_needs_helper",
-        raw_empty and wrapped_ok,
-        wrapped_fields,
-        f"raw run_in_executor 无 trace ({raw_empty})；run_in_thread helper 有 trace ({wrapped_ok})",
+        "test_run_in_executor_transparent_after_patch",
+        has_trace(thread_fields),
+        thread_fields,
+        "patch 后：原生 loop.run_in_executor 自动继承 trace（用户零感知）",
     )
+
+
+# ══════════════════════════════════════════════
+# Group 7: 防御性测试 —— 边界失败场景的兜底
+# ══════════════════════════════════════════════
+
+class _MockRequest:
+    """轻量模拟 Sanic Request，供 middleware._after_response 使用"""
+    class _Ctx: pass
+    def __init__(self):
+        self.ctx = self._Ctx()
+
+
+class _MockResponse:
+    """轻量模拟 Sanic Response，供 middleware._after_response 使用"""
+    def __init__(self, status=200):
+        self.status = status
+        self.headers = {}
+
+
+async def test_defense_after_response_cleanup_when_no_response():
+    """
+    防御测试 1: handler 抛异常未产生响应时 (response=None)，
+    send 永远不会被调用 → _after_response 必须兜底清理，防止 span 泄漏
+    """
+    from log_middleware.middleware import (
+        SanicTraceMiddleware, _REQUEST_TRACE, _TraceCleanupInfo,
+    )
+
+    _, tracer, _, _ = make_test_env()
+
+    # 构造一个已 attach 但尚未清理的请求上下文
+    span = tracer.start_span("POST /api/broken")
+    ctx = trace.set_span_in_context(span)
+    token = context_api.attach(ctx)
+    info = _TraceCleanupInfo(span=span, token=token)
+    _REQUEST_TRACE.set(info)
+
+    mock_req = _MockRequest()
+    mock_req.ctx.otel_span = span
+    mock_req.ctx.otel_token = token
+
+    # 模拟中间件被创建 (触发 patch 一次), 但用一个未经初始化的实例调用 _after_response
+    mw = SanicTraceMiddleware.__new__(SanicTraceMiddleware)
+    await mw._after_response(mock_req, None)  # response=None → 兜底触发
+
+    # 断言：立即清理已发生
+    span_ended = getattr(span, "_end_time", None) is not None
+    passed = info.done and span_ended
+    # 手动 detach 一次以恢复 ContextVar（避免影响后续测试）
+    # 注意：info.done 之后 detach 已在 _after_response 内做过，这里不再重复
+    report(
+        "test_defense_after_response_cleanup_when_no_response",
+        passed,
+        {"trace_id": format(span.get_span_context().trace_id, "032x"),
+         "span_id": format(span.get_span_context().span_id, "016x"),
+         "parent_span_id": ""},
+        f"response=None 时兜底：info.done={info.done}, span 已 end={span_ended}",
+    )
+
+
+async def test_defense_after_response_fallback_when_send_patch_disabled():
+    """
+    防御测试 2: send patch 未生效（模拟 Sanic 不兼容）→ 有 response 的正常请求
+    也必须由 _after_response 立即清理（退回旧逻辑）
+    """
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import (
+        SanicTraceMiddleware, _REQUEST_TRACE, _TraceCleanupInfo,
+    )
+
+    _, tracer, _, _ = make_test_env()
+
+    # 临时禁用 send patch（模拟 Sanic 不兼容）
+    original_active = mw_mod._send_patch_active
+    mw_mod._send_patch_active = False
+    try:
+        span = tracer.start_span("GET /api/normal")
+        ctx = trace.set_span_in_context(span)
+        token = context_api.attach(ctx)
+        info = _TraceCleanupInfo(span=span, token=token)
+        _REQUEST_TRACE.set(info)
+
+        mock_req = _MockRequest()
+        mock_req.ctx.otel_span = span
+        mock_req.ctx.otel_token = token
+        mock_resp = _MockResponse(status=200)
+
+        mw = SanicTraceMiddleware.__new__(SanicTraceMiddleware)
+        await mw._after_response(mock_req, mock_resp)
+
+        span_ended = getattr(span, "_end_time", None) is not None
+        passed = info.done and span_ended
+        # 顺便检查 X-Trace-Id 头也被设置了
+        header_set = "X-Trace-Id" in mock_resp.headers
+        report(
+            "test_defense_after_response_fallback_when_send_patch_disabled",
+            passed and header_set,
+            {"trace_id": mock_resp.headers.get("X-Trace-Id", ""),
+             "span_id": format(span.get_span_context().span_id, "016x"),
+             "parent_span_id": ""},
+            f"send patch 关闭 → _after_response 立即清理（info.done={info.done}），"
+            f"X-Trace-Id 头已设置: {header_set}",
+        )
+    finally:
+        mw_mod._send_patch_active = original_active
+
+
+async def test_defense_patch_success_keeps_delayed_cleanup():
+    """
+    防御测试 3: send patch 生效时（正常场景），_after_response 不应立即清理，
+    保留延迟到 send(end_stream=True) 才清理的行为
+    """
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import (
+        SanicTraceMiddleware, _REQUEST_TRACE, _TraceCleanupInfo,
+    )
+
+    _, tracer, _, _ = make_test_env()
+
+    # 确保 send patch 处于生效状态
+    original_active = mw_mod._send_patch_active
+    mw_mod._send_patch_active = True
+    try:
+        span = tracer.start_span("GET /api/streaming")
+        ctx = trace.set_span_in_context(span)
+        token = context_api.attach(ctx)
+        info = _TraceCleanupInfo(span=span, token=token)
+        _REQUEST_TRACE.set(info)
+
+        mock_req = _MockRequest()
+        mock_req.ctx.otel_span = span
+        mock_req.ctx.otel_token = token
+        mock_resp = _MockResponse(status=200)
+
+        mw = SanicTraceMiddleware.__new__(SanicTraceMiddleware)
+        await mw._after_response(mock_req, mock_resp)
+
+        # 关键：info.done 必须还是 False（清理被延迟）
+        span_ended = getattr(span, "_end_time", None) is not None
+        passed = (not info.done) and (not span_ended)
+        # 收尾清理，避免影响后续测试
+        span.end()
+        context_api.detach(token)
+        report(
+            "test_defense_patch_success_keeps_delayed_cleanup",
+            passed,
+            {"trace_id": mock_resp.headers.get("X-Trace-Id", ""),
+             "span_id": format(span.get_span_context().span_id, "016x"),
+             "parent_span_id": ""},
+            f"send patch 启用 → _after_response 延迟清理（info.done={info.done}, span_ended={span_ended}）",
+        )
+    finally:
+        mw_mod._send_patch_active = original_active
 
 
 # ══════════════════════════════════════════════
@@ -819,7 +971,17 @@ async def run_all():
     print("\n─── Group 6: handler 内并发调度（gather / create_task / 线程池）──")
     await test_gather_coroutines_in_handler()
     await test_create_task_inside_active_context()
-    await test_run_in_executor_needs_helper()
+    # 触发全局 patch —— 模拟 SanicTraceMiddleware 初始化时对 run_in_executor 的 patch
+    # 之前 Group 3 test_run_in_executor_loses_context 需要"未 patch"的 baseline，
+    # 所以 patch 放在这里而非 import 时
+    from log_middleware.middleware import _patch_run_in_executor_once
+    _patch_run_in_executor_once()
+    await test_run_in_executor_transparent_after_patch()
+
+    print("\n─── Group 7: 防御性兜底（Sanic 兼容探测 + _after_response 兜底）─")
+    await test_defense_after_response_cleanup_when_no_response()
+    await test_defense_after_response_fallback_when_send_patch_disabled()
+    await test_defense_patch_success_keeps_delayed_cleanup()
 
     # ── 汇总 ──
     print("\n" + "═" * 72)
@@ -855,6 +1017,10 @@ async def run_all():
     print("  │       _after_response 不再 detach；send(end_stream=True) 时才清理")
     print("  │       streaming_fn 与 handler 同 Task → ContextVar 天然保持有效")
     print("  │  13.  并发请求各自 Task 独立 ContextVar → trace_id 严格隔离，不串号")
+    print("  │  14.  asyncio.gather(coro1(), coro2()) → 同 Task 天然共享 ContextVar")
+    print("  │  15.  handler 内 asyncio.create_task(coro) → 自动 copy_context() 携带 span")
+    print("  │  16.  全局 patch BaseEventLoop.run_in_executor → 原生调用自动携带 trace")
+    print("  │       （patch 后用户无需改 loop.run_in_executor 的任何代码）")
     print("  └─────────────────────────────────────────────────────────────────")
 
     if passed < total:
