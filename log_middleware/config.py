@@ -15,7 +15,7 @@ class TraceConfig:
     otlp_endpoint: str = "http://localhost:4318"  # OTLP HTTP 端点，exporter_type="otlp" 时生效
     log_format: str = (
         "[%(asctime)s] %(levelname)s "
-        "[trace_id=%(trace_id)s span_id=%(span_id)s parent_span_id=%(parent_span_id)s] "
+        "[%(trace_id)s - %(span_id)s - %(parent_span_id)s] "
         "[%(name)s] %(message)s"
     )
     log_level: int = 10  # logging.DEBUG

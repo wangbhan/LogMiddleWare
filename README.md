@@ -69,7 +69,7 @@ if __name__ == "__main__":
 
 **日志输出：**
 ```
-[2026-07-03 16:34:37,493] INFO [trace_id=7b2ae787... span_id=4ed03c7a... parent_span_id=0000...] [my-service] 处理请求
+[2026-07-03 16:34:37,493] INFO [7b2ae787... - 4ed03c7a... - ] [my-service] 处理请求
 ```
 
 ---
@@ -95,10 +95,10 @@ SDK的`TraceContextFilter`会自动将零值trace字段转换为空字符串：
 
 ```python
 # 启动日志（无trace上下文）
-[2026-07-08 10:22:43,015] INFO [trace_id= span_id= parent_span_id=] [sanic.root] Sanic v25.12.1
+[2026-07-08 10:22:43,015] INFO [ -  - ] [sanic.root] Sanic v25.12.1
 
 # 业务日志（有trace上下文）
-[2026-07-08 10:23:45,123] INFO [trace_id=4bf92f35... span_id=00f067aa... parent_span_id=0000...] [my-service] 处理请求
+[2026-07-08 10:23:45,123] INFO [4bf92f35... - 00f067aa... - ] [my-service] 处理请求
 ```
 
 **实现机制**：当检测到trace context无效时，SDK将trace字段设置为空字符串而不是零值。
@@ -111,7 +111,7 @@ SDK的`TraceContextFilter`会自动将零值trace字段转换为空字符串：
 processors:
   # 解析日志格式
   - dissect:
-      tokenizer: '[%{ts}] %{level} [trace_id=%{trace_id} span_id=%{span_id} parent_span_id=%{parent_span_id}] [%{logger}] %{message}'
+      tokenizer: '[%{ts}] %{level} [%{trace_id} - %{span_id} - %{parent_span_id}] [%{logger}] %{message}'
       field: message
       target_prefix: ""
       overwrite_keys: true
@@ -195,10 +195,10 @@ async def internal_data(request):
 **日志效果：**
 ```
 # service_a 日志
-[INFO] [trace_id=4bf92f35... span_id=00f067aa... parent_span_id=0000...] [service-a] 开始处理请求
+[INFO] [4bf92f35... - 00f067aa... - ] [service-a] 开始处理请求
 
 # service_b 日志（trace_id 相同，span_id 不同，parent_span_id = service_a 的 span_id）
-[INFO] [trace_id=4bf92f35... span_id=b9c7c989... parent_span_id=00f067aa...] [service-b] 收到内部请求
+[INFO] [4bf92f35... - b9c7c989... - 00f067aa...] [service-b] 收到内部请求
 ```
 
 ---
@@ -262,7 +262,7 @@ config = TraceConfig(
     # 注意：启动时的零值trace会自动转换为空字符串，便于ES采集端过滤
     log_format=(
         "[%(asctime)s] %(levelname)s "
-        "[trace_id=%(trace_id)s span_id=%(span_id)s parent_span_id=%(parent_span_id)s] "
+        "[%(trace_id)s - %(span_id)s - %(parent_span_id)s] "
         "[%(name)s] %(message)s"
     ),
 

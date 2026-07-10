@@ -11,8 +11,8 @@ filebeat.inputs:
 processors:
   - dissect:
       # 解析 SDK 默认日志格式：
-      # [2026-07-07 10:23:45,123] INFO [trace_id=xxx span_id=yyy parent_span_id=zzz] [logger] message
-      tokenizer: '[%{ts}] %{level} [trace_id=%{trace_id} span_id=%{span_id} parent_span_id=%{parent_span_id}] [%{logger}] %{message}'
+      # [2026-07-07 10:23:45,123] INFO [xxx - yyy - zzz] [logger] message
+      tokenizer: '[%{ts}] %{level} [%{trace_id} - %{span_id} - %{parent_span_id}] [%{logger}] %{message}'
       field: message
       target_prefix: ""
       overwrite_keys: true
