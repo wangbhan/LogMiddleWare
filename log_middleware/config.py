@@ -10,7 +10,6 @@ class TraceConfig:
     log_max_bytes: int = 10 * 1024 * 1024    # 单文件上限，默认 10 MB
     log_backup_count: int = 5                # 保留旧文件数，默认 5 个
     processor_type: str = "simple"  # "simple" | "batch"
-    auto_instrument_aiohttp: bool = True  # 自动拦截 aiohttp 出站请求，无需手动 inject headers
     resource_attributes: dict = field(default_factory=dict)  # 自定义 resource 属性，合并到 Span 的 resource 块
     otlp_endpoint: str = "http://localhost:4318"  # OTLP HTTP 端点，exporter_type="otlp" 时生效
     log_format: str = (

@@ -29,6 +29,9 @@ _REQUEST_TRACE: ContextVar[_TraceCleanupInfo | None] = ContextVar(
 _sanic_send_patched = False       # 是否已尝试过 patch（保证幂等，无论成功失败）
 _send_patch_active = False        # send patch 是否真正生效（探测失败时为 False）
 _run_in_executor_patched = False
+_aiohttp_inject_patched = False
+_httpx_inject_patched = False
+_requests_inject_patched = False
 
 
 def _patch_run_in_executor_once() -> None:
@@ -64,6 +67,119 @@ def _patch_run_in_executor_once() -> None:
         return _orig_run_in_executor(self, executor, _wrapped, *args)
 
     BaseEventLoop.run_in_executor = _traced_run_in_executor
+
+
+def _patch_aiohttp_inject_once() -> None:
+    """
+    对 aiohttp.ClientSession.__init__ 做一次全局 patch，自动向每个出站请求注入
+    W3C traceparent 头，使下游服务的 parent_span_id 直接指向当前 SERVER span。
+
+    与 AioHttpClientInstrumentor 的区别：不创建中间 CLIENT span，日志链路直接可追。
+    业务代码无需任何改动，也无需手动调用 inject_trace_headers。
+    """
+    global _aiohttp_inject_patched
+    if _aiohttp_inject_patched:
+        return
+    _aiohttp_inject_patched = True
+
+    try:
+        import aiohttp
+        from opentelemetry.propagate import inject as otel_inject
+    except ImportError:
+        return
+
+    _orig_init = aiohttp.ClientSession.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        tc = aiohttp.TraceConfig()
+
+        async def _inject_headers(session, ctx, params):
+            otel_inject(params.headers)
+
+        tc.on_request_start.append(_inject_headers)
+        existing = list(kwargs.pop("trace_configs", []))
+        kwargs["trace_configs"] = [tc] + existing
+        _orig_init(self, *args, **kwargs)
+
+    aiohttp.ClientSession.__init__ = _patched_init
+
+
+def _patch_httpx_inject_once() -> None:
+    """
+    对 httpx.AsyncClient.__init__ 和 httpx.Client.__init__ 做一次全局 patch，
+    自动向每个出站请求注入 W3C traceparent 头。
+
+    httpx 通过 event_hooks['request'] 回调在发送前修改请求头：
+    - AsyncClient 的 hook 必须是 async def
+    - Client 的 hook 必须是普通 def
+    用户已有的 event_hooks 会被保留在 SDK hook 之后执行。
+    """
+    global _httpx_inject_patched
+    if _httpx_inject_patched:
+        return
+    _httpx_inject_patched = True
+
+    try:
+        import httpx
+        from opentelemetry.propagate import inject as otel_inject
+    except ImportError:
+        return
+
+    _orig_async_init = httpx.AsyncClient.__init__
+
+    def _async_patched_init(self, *args, **kwargs):
+        hooks = dict(kwargs.pop("event_hooks", None) or {})
+
+        async def _inject(request):
+            otel_inject(request.headers)
+
+        hooks.setdefault("request", []).insert(0, _inject)
+        kwargs["event_hooks"] = hooks
+        _orig_async_init(self, *args, **kwargs)
+
+    httpx.AsyncClient.__init__ = _async_patched_init
+
+    _orig_sync_init = httpx.Client.__init__
+
+    def _sync_patched_init(self, *args, **kwargs):
+        hooks = dict(kwargs.pop("event_hooks", None) or {})
+
+        def _inject(request):
+            otel_inject(request.headers)
+
+        hooks.setdefault("request", []).insert(0, _inject)
+        kwargs["event_hooks"] = hooks
+        _orig_sync_init(self, *args, **kwargs)
+
+    httpx.Client.__init__ = _sync_patched_init
+
+
+def _patch_requests_inject_once() -> None:
+    """
+    对 requests.Session.send 做一次全局 patch，自动向 PreparedRequest 注入
+    W3C traceparent 头。
+
+    requests 是同步库，通常在独立脚本中使用。此函数不由 SanicTraceMiddleware
+    自动调用，需在脚本入口处手动调用一次（或通过 from log_middleware import patch_requests）。
+    """
+    global _requests_inject_patched
+    if _requests_inject_patched:
+        return
+    _requests_inject_patched = True
+
+    try:
+        import requests
+        from opentelemetry.propagate import inject as otel_inject
+    except ImportError:
+        return
+
+    _orig_send = requests.Session.send
+
+    def _patched_send(self, request, **kwargs):
+        otel_inject(request.headers)
+        return _orig_send(self, request, **kwargs)
+
+    requests.Session.send = _patched_send
 
 
 def _patch_sanic_send_once() -> None:
@@ -148,6 +264,9 @@ class SanicTraceMiddleware:
         _patch_sanic_send_once()
         # 同时 patch loop.run_in_executor：线程池自动继承当前 asyncio Task 的 OTel 上下文
         _patch_run_in_executor_once()
+        # patch aiohttp / httpx：自动注入 traceparent，不创建中间 CLIENT span
+        _patch_aiohttp_inject_once()
+        _patch_httpx_inject_once()
 
     async def _before_request(self, request):
         traceparent = request.headers.get("traceparent")

@@ -937,6 +937,538 @@ async def test_defense_patch_success_keeps_delayed_cleanup():
 
 
 # ══════════════════════════════════════════════
+# Group 8: aiohttp 出站请求自动注入 traceparent
+# ══════════════════════════════════════════════
+
+async def test_aiohttp_patch_injects_traceparent():
+    """
+    验证：_patch_aiohttp_inject_once() 后，普通 aiohttp.ClientSession 出站请求
+    自动携带 traceparent 头，无需业务代码任何改动。
+    """
+    import aiohttp
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_aiohttp_inject_once
+
+    saved_patched = mw_mod._aiohttp_inject_patched
+    saved_init = aiohttp.ClientSession.__init__
+    mw_mod._aiohttp_inject_patched = False
+
+    received_headers: dict = {}
+
+    async def handler(request):
+        received_headers.update(dict(request.headers))
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+
+    _, tracer, _, _ = make_test_env()
+
+    try:
+        _patch_aiohttp_inject_once()
+
+        with tracer.start_as_current_span("service-a-server-span") as span:
+            span_ctx = span.get_span_context()
+            expected_trace_id = format(span_ctx.trace_id, "032x")
+            expected_span_id = format(span_ctx.span_id, "016x")
+
+            async with TestServer(app) as server:
+                async with aiohttp.ClientSession() as session:
+                    await session.get(server.make_url("/"))
+
+        tp = received_headers.get("traceparent", "")
+        parts = tp.split("-")
+        passed = (
+            len(parts) == 4
+            and parts[1] == expected_trace_id
+            and parts[2] == expected_span_id
+        )
+        report(
+            "test_aiohttp_patch_injects_traceparent",
+            passed,
+            {"trace_id": expected_trace_id, "span_id": expected_span_id, "parent_span_id": ""},
+            f"traceparent={tp}  parent-id == SERVER span_id: {passed}",
+        )
+    finally:
+        mw_mod._aiohttp_inject_patched = saved_patched
+        aiohttp.ClientSession.__init__ = saved_init
+
+
+async def test_aiohttp_patch_idempotent():
+    """
+    验证：_patch_aiohttp_inject_once() 多次调用幂等，__init__ 只被替换一次。
+    """
+    import aiohttp
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_aiohttp_inject_once
+
+    saved_patched = mw_mod._aiohttp_inject_patched
+    saved_init = aiohttp.ClientSession.__init__
+    mw_mod._aiohttp_inject_patched = False
+
+    try:
+        _patch_aiohttp_inject_once()
+        patched_init = aiohttp.ClientSession.__init__
+
+        _patch_aiohttp_inject_once()  # 第二次调用
+        still_same = aiohttp.ClientSession.__init__ is patched_init
+
+        report(
+            "test_aiohttp_patch_idempotent",
+            still_same,
+            {"trace_id": "", "span_id": "", "parent_span_id": ""},
+            f"多次调用 patch，__init__ 引用不变: {still_same}",
+        )
+    finally:
+        mw_mod._aiohttp_inject_patched = saved_patched
+        aiohttp.ClientSession.__init__ = saved_init
+
+
+async def test_aiohttp_no_span_no_traceparent():
+    """
+    验证：无活跃 span 时发出的请求不携带有效 traceparent（OTel 注入空上下文时不写头）。
+    """
+    import aiohttp
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_aiohttp_inject_once
+
+    saved_patched = mw_mod._aiohttp_inject_patched
+    saved_init = aiohttp.ClientSession.__init__
+    mw_mod._aiohttp_inject_patched = False
+
+    received_headers: dict = {}
+
+    async def handler(request):
+        received_headers.update(dict(request.headers))
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+
+    try:
+        _patch_aiohttp_inject_once()
+
+        # 不建立任何 span 上下文，直接发请求
+        async with TestServer(app) as server:
+            async with aiohttp.ClientSession() as session:
+                await session.get(server.make_url("/"))
+
+        no_traceparent = "traceparent" not in received_headers
+        report(
+            "test_aiohttp_no_span_no_traceparent",
+            no_traceparent,
+            {"trace_id": "", "span_id": "", "parent_span_id": ""},
+            f"无 span 上下文时 traceparent 不注入: {no_traceparent}",
+        )
+    finally:
+        mw_mod._aiohttp_inject_patched = saved_patched
+        aiohttp.ClientSession.__init__ = saved_init
+
+
+async def test_aiohttp_existing_trace_configs_preserved():
+    """
+    验证：patch 后，业务代码自带的 aiohttp.TraceConfig 仍正常工作，
+    不被 SDK 注入的 trace config 覆盖。
+    """
+    import aiohttp
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_aiohttp_inject_once
+
+    saved_patched = mw_mod._aiohttp_inject_patched
+    saved_init = aiohttp.ClientSession.__init__
+    mw_mod._aiohttp_inject_patched = False
+
+    user_hook_called = False
+    received_headers: dict = {}
+
+    async def handler(request):
+        received_headers.update(dict(request.headers))
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+
+    _, tracer, _, _ = make_test_env()
+
+    try:
+        _patch_aiohttp_inject_once()
+
+        # 业务侧自定义 TraceConfig
+        user_tc = aiohttp.TraceConfig()
+
+        async def user_hook(session, ctx, params):
+            nonlocal user_hook_called
+            user_hook_called = True
+
+        user_tc.on_request_start.append(user_hook)
+
+        with tracer.start_as_current_span("service-a-span") as span:
+            span_ctx = span.get_span_context()
+            expected_span_id = format(span_ctx.span_id, "016x")
+
+            async with TestServer(app) as server:
+                async with aiohttp.ClientSession(trace_configs=[user_tc]) as session:
+                    await session.get(server.make_url("/"))
+
+        tp = received_headers.get("traceparent", "")
+        tp_parts = tp.split("-")
+        traceparent_ok = len(tp_parts) == 4 and tp_parts[2] == expected_span_id
+
+        passed = user_hook_called and traceparent_ok
+        report(
+            "test_aiohttp_existing_trace_configs_preserved",
+            passed,
+            {"trace_id": "", "span_id": expected_span_id, "parent_span_id": ""},
+            f"业务 hook 被调用: {user_hook_called}，traceparent 正确注入: {traceparent_ok}",
+        )
+    finally:
+        mw_mod._aiohttp_inject_patched = saved_patched
+        aiohttp.ClientSession.__init__ = saved_init
+
+
+# ══════════════════════════════════════════════
+# Group 9: httpx 出站请求自动注入 traceparent
+# ══════════════════════════════════════════════
+
+async def test_httpx_async_patch_injects_traceparent():
+    """
+    验证：_patch_httpx_inject_once() 后，httpx.AsyncClient 出站请求自动携带 traceparent，
+    parent-id 直接等于当前 SERVER span 的 span_id（无中间 CLIENT span）。
+    """
+    import httpx
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_httpx_inject_once
+
+    saved_patched = mw_mod._httpx_inject_patched
+    saved_async_init = httpx.AsyncClient.__init__
+    mw_mod._httpx_inject_patched = False
+
+    captured_headers: dict = {}
+
+    def mock_transport(request):
+        captured_headers.update(dict(request.headers))
+        return httpx.Response(200)
+
+    _, tracer, _, _ = make_test_env()
+
+    try:
+        _patch_httpx_inject_once()
+
+        with tracer.start_as_current_span("service-a-server-span") as span:
+            span_ctx = span.get_span_context()
+            expected_trace_id = format(span_ctx.trace_id, "032x")
+            expected_span_id = format(span_ctx.span_id, "016x")
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(mock_transport)) as client:
+                await client.get("http://testserver/")
+
+        tp = captured_headers.get("traceparent", "")
+        parts = tp.split("-")
+        passed = (
+            len(parts) == 4
+            and parts[1] == expected_trace_id
+            and parts[2] == expected_span_id
+        )
+        report(
+            "test_httpx_async_patch_injects_traceparent",
+            passed,
+            {"trace_id": expected_trace_id, "span_id": expected_span_id, "parent_span_id": ""},
+            f"traceparent={tp}  parent-id == SERVER span_id: {passed}",
+        )
+    finally:
+        mw_mod._httpx_inject_patched = saved_patched
+        httpx.AsyncClient.__init__ = saved_async_init
+
+
+async def test_httpx_sync_patch_injects_traceparent():
+    """
+    验证：_patch_httpx_inject_once() 后，httpx.Client（同步）出站请求自动携带 traceparent。
+    """
+    import httpx
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_httpx_inject_once
+
+    saved_patched = mw_mod._httpx_inject_patched
+    saved_sync_init = httpx.Client.__init__
+    mw_mod._httpx_inject_patched = False
+
+    captured_headers: dict = {}
+
+    def mock_transport(request):
+        captured_headers.update(dict(request.headers))
+        return httpx.Response(200)
+
+    _, tracer, _, _ = make_test_env()
+
+    try:
+        _patch_httpx_inject_once()
+
+        with tracer.start_as_current_span("service-a-server-span") as span:
+            span_ctx = span.get_span_context()
+            expected_trace_id = format(span_ctx.trace_id, "032x")
+            expected_span_id = format(span_ctx.span_id, "016x")
+
+            with httpx.Client(transport=httpx.MockTransport(mock_transport)) as client:
+                client.get("http://testserver/")
+
+        tp = captured_headers.get("traceparent", "")
+        parts = tp.split("-")
+        passed = (
+            len(parts) == 4
+            and parts[1] == expected_trace_id
+            and parts[2] == expected_span_id
+        )
+        report(
+            "test_httpx_sync_patch_injects_traceparent",
+            passed,
+            {"trace_id": expected_trace_id, "span_id": expected_span_id, "parent_span_id": ""},
+            f"traceparent={tp}  parent-id == SERVER span_id: {passed}",
+        )
+    finally:
+        mw_mod._httpx_inject_patched = saved_patched
+        httpx.Client.__init__ = saved_sync_init
+
+
+async def test_httpx_patch_idempotent():
+    """
+    验证：_patch_httpx_inject_once() 多次调用幂等，AsyncClient/Client.__init__ 只被替换一次。
+    """
+    import httpx
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_httpx_inject_once
+
+    saved_patched = mw_mod._httpx_inject_patched
+    saved_async_init = httpx.AsyncClient.__init__
+    saved_sync_init = httpx.Client.__init__
+    mw_mod._httpx_inject_patched = False
+
+    try:
+        _patch_httpx_inject_once()
+        patched_async = httpx.AsyncClient.__init__
+        patched_sync = httpx.Client.__init__
+
+        _patch_httpx_inject_once()  # 第二次调用
+        still_same = (
+            httpx.AsyncClient.__init__ is patched_async
+            and httpx.Client.__init__ is patched_sync
+        )
+        report(
+            "test_httpx_patch_idempotent",
+            still_same,
+            {"trace_id": "", "span_id": "", "parent_span_id": ""},
+            f"多次调用后 AsyncClient/Client.__init__ 引用不变: {still_same}",
+        )
+    finally:
+        mw_mod._httpx_inject_patched = saved_patched
+        httpx.AsyncClient.__init__ = saved_async_init
+        httpx.Client.__init__ = saved_sync_init
+
+
+async def test_httpx_existing_event_hooks_preserved():
+    """
+    验证：patch 后，业务代码自带的 event_hooks 仍正常触发，不被 SDK hook 覆盖。
+    """
+    import httpx
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_httpx_inject_once
+
+    saved_patched = mw_mod._httpx_inject_patched
+    saved_async_init = httpx.AsyncClient.__init__
+    mw_mod._httpx_inject_patched = False
+
+    user_hook_called = False
+    captured_headers: dict = {}
+
+    def mock_transport(request):
+        captured_headers.update(dict(request.headers))
+        return httpx.Response(200)
+
+    _, tracer, _, _ = make_test_env()
+
+    try:
+        _patch_httpx_inject_once()
+
+        async def user_hook(request):
+            nonlocal user_hook_called
+            user_hook_called = True
+
+        with tracer.start_as_current_span("service-a-span") as span:
+            span_ctx = span.get_span_context()
+            expected_span_id = format(span_ctx.span_id, "016x")
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(mock_transport),
+                event_hooks={"request": [user_hook]},
+            ) as client:
+                await client.get("http://testserver/")
+
+        tp = captured_headers.get("traceparent", "")
+        tp_parts = tp.split("-")
+        traceparent_ok = len(tp_parts) == 4 and tp_parts[2] == expected_span_id
+        passed = user_hook_called and traceparent_ok
+        report(
+            "test_httpx_existing_event_hooks_preserved",
+            passed,
+            {"trace_id": "", "span_id": expected_span_id, "parent_span_id": ""},
+            f"业务 hook 被调用: {user_hook_called}，traceparent 正确注入: {traceparent_ok}",
+        )
+    finally:
+        mw_mod._httpx_inject_patched = saved_patched
+        httpx.AsyncClient.__init__ = saved_async_init
+
+
+# ══════════════════════════════════════════════
+# Group 10: requests 出站请求注入 traceparent
+# ══════════════════════════════════════════════
+
+async def test_requests_patch_injects_traceparent():
+    """
+    验证：_patch_requests_inject_once() 后，requests.Session 出站请求自动携带 traceparent。
+    mock HTTPAdapter.send（底层传输层）捕获 PreparedRequest.headers，不建立真实 TCP 连接。
+    patched Session.send 先注入 headers，再调用 HTTPAdapter.send，此处捕获到注入后的结果。
+    """
+    import requests
+    import requests.adapters
+    from unittest.mock import MagicMock, patch as mock_patch
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_requests_inject_once
+
+    saved_patched = mw_mod._requests_inject_patched
+    saved_send = requests.Session.send
+    mw_mod._requests_inject_patched = False
+
+    _, tracer, _, _ = make_test_env()
+    captured_headers: dict = {}
+
+    try:
+        _patch_requests_inject_once()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers = requests.structures.CaseInsensitiveDict()
+        mock_response.cookies = requests.cookies.RequestsCookieJar()
+        mock_response.history = []
+        mock_response.url = "http://testserver/"
+        mock_response.encoding = "utf-8"
+        mock_response.raw = MagicMock()
+        mock_response.is_redirect = False
+        mock_response.content = b""
+
+        def fake_adapter_send(self, request, **kwargs):
+            # 此时 patched Session.send 已注入 headers，在这里捕获
+            captured_headers.update(dict(request.headers))
+            return mock_response
+
+        with tracer.start_as_current_span("service-a-server-span") as span:
+            span_ctx = span.get_span_context()
+            expected_trace_id = format(span_ctx.trace_id, "032x")
+            expected_span_id = format(span_ctx.span_id, "016x")
+
+            with mock_patch.object(requests.adapters.HTTPAdapter, "send", fake_adapter_send):
+                session = requests.Session()
+                session.get("http://testserver/")
+
+        tp = captured_headers.get("traceparent", "")
+        parts = tp.split("-")
+        passed = (
+            len(parts) == 4
+            and parts[1] == expected_trace_id
+            and parts[2] == expected_span_id
+        )
+        report(
+            "test_requests_patch_injects_traceparent",
+            passed,
+            {"trace_id": expected_trace_id, "span_id": expected_span_id, "parent_span_id": ""},
+            f"traceparent={tp}  parent-id == SERVER span_id: {passed}",
+        )
+    finally:
+        mw_mod._requests_inject_patched = saved_patched
+        requests.Session.send = saved_send
+
+
+async def test_requests_patch_idempotent():
+    """验证：_patch_requests_inject_once() 多次调用幂等，Session.send 只被替换一次。"""
+    import requests
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_requests_inject_once
+
+    saved_patched = mw_mod._requests_inject_patched
+    saved_send = requests.Session.send
+    mw_mod._requests_inject_patched = False
+
+    try:
+        _patch_requests_inject_once()
+        patched_send = requests.Session.send
+
+        _patch_requests_inject_once()  # 第二次调用
+        still_same = requests.Session.send is patched_send
+        report(
+            "test_requests_patch_idempotent",
+            still_same,
+            {"trace_id": "", "span_id": "", "parent_span_id": ""},
+            f"多次调用后 Session.send 引用不变: {still_same}",
+        )
+    finally:
+        mw_mod._requests_inject_patched = saved_patched
+        requests.Session.send = saved_send
+
+
+async def test_requests_no_span_no_traceparent():
+    """验证：无活跃 span 时 requests 不注入有效 traceparent。"""
+    import requests
+    import requests.adapters
+    from unittest.mock import MagicMock, patch as mock_patch
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_requests_inject_once
+
+    saved_patched = mw_mod._requests_inject_patched
+    saved_send = requests.Session.send
+    mw_mod._requests_inject_patched = False
+
+    captured_headers: dict = {}
+
+    try:
+        _patch_requests_inject_once()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers = requests.structures.CaseInsensitiveDict()
+        mock_response.cookies = requests.cookies.RequestsCookieJar()
+        mock_response.history = []
+        mock_response.url = "http://testserver/"
+        mock_response.encoding = "utf-8"
+        mock_response.raw = MagicMock()
+        mock_response.is_redirect = False
+        mock_response.content = b""
+
+        def fake_adapter_send(self, request, **kwargs):
+            captured_headers.update(dict(request.headers))
+            return mock_response
+
+        # 无 span 上下文，直接发请求
+        with mock_patch.object(requests.adapters.HTTPAdapter, "send", fake_adapter_send):
+            session = requests.Session()
+            session.get("http://testserver/")
+
+        no_traceparent = "traceparent" not in captured_headers
+        report(
+            "test_requests_no_span_no_traceparent",
+            no_traceparent,
+            {"trace_id": "", "span_id": "", "parent_span_id": ""},
+            f"无 span 上下文时 traceparent 不注入: {no_traceparent}",
+        )
+    finally:
+        mw_mod._requests_inject_patched = saved_patched
+        requests.Session.send = saved_send
+
+
+# ══════════════════════════════════════════════
 # 测试运行器
 # ══════════════════════════════════════════════
 
@@ -982,6 +1514,23 @@ async def run_all():
     await test_defense_after_response_cleanup_when_no_response()
     await test_defense_after_response_fallback_when_send_patch_disabled()
     await test_defense_patch_success_keeps_delayed_cleanup()
+
+    print("\n─── Group 8: aiohttp 出站请求自动注入 traceparent（零代码侵入）──")
+    await test_aiohttp_patch_injects_traceparent()
+    await test_aiohttp_patch_idempotent()
+    await test_aiohttp_no_span_no_traceparent()
+    await test_aiohttp_existing_trace_configs_preserved()
+
+    print("\n─── Group 9: httpx 出站请求自动注入 traceparent（异步 + 同步）──")
+    await test_httpx_async_patch_injects_traceparent()
+    await test_httpx_sync_patch_injects_traceparent()
+    await test_httpx_patch_idempotent()
+    await test_httpx_existing_event_hooks_preserved()
+
+    print("\n─── Group 10: requests 出站请求注入 traceparent（独立脚本场景）─")
+    await test_requests_patch_injects_traceparent()
+    await test_requests_patch_idempotent()
+    await test_requests_no_span_no_traceparent()
 
     # ── 汇总 ──
     print("\n" + "═" * 72)
