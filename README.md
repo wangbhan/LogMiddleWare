@@ -11,7 +11,8 @@
 - **零侵入接入**：像注册 Sanic 中间件一样一行接入，业务代码无需改动
 - **自动日志注入**：所有层（controller / service / repository）的日志自动携带 `trace_id`、`span_id`、`parent_span_id`
 - **跨服务链路传播**：基于 W3C TraceContext 标准，多个服务共享同一 `trace_id`
-- **aiohttp 自动拦截**：出站 HTTP 请求自动注入 `traceparent` 头，无需手动调用
+- **HTTP 客户端自动追踪**：支持 aiohttp、httpx、requests 客户端自动注入 traceparent 头
+- **异步上下文完整追踪**：支持 asyncio.create_task 和线程池的完整链路追踪
 - **分层架构透明**：asyncio ContextVar 机制保证 controller → service → repository 全链路透传
 - **日志落盘**：支持将带 trace 字段的日志文本写入文件，内置按大小自动轮转，目录不存在时自动创建
 - **自定义 Resource**：支持自定义 Span 的 resource 属性（服务版本、环境、自定义标签等）
@@ -144,6 +145,56 @@ processors:
 
 多个服务之间通过 HTTP 调用时，`trace_id` 自动透传，无需手动注入请求头。
 
+**方式一：使用自动追踪包装类（推荐）**
+
+SDK提供了`Traced*`系列包装类，直接替换原生客户端即可自动注入traceparent：
+
+```python
+import logging
+from sanic import Sanic
+import sanic.response
+from log_middleware import SanicTraceMiddleware, setup_trace_logging, TracedClientSession
+
+app = Sanic("service-a")
+SanicTraceMiddleware(app, service_name="service-a")
+setup_trace_logging()
+
+logger = logging.getLogger("service-a")
+
+@app.get("/api/users")
+async def get_users(request):
+    logger.info("开始处理请求")
+
+    # 使用 TracedClientSession 替代原生 aiohttp.ClientSession
+    async with TracedClientSession() as session:
+        async with session.get("http://localhost:8001/internal/data") as resp:
+            data = await resp.json()
+
+    logger.info("请求处理完成")
+    return sanic.response.json({"users": data})
+```
+
+**支持的客户端包装类：**
+- `TracedClientSession` - 替代 `aiohttp.ClientSession`
+- `TracedAsyncClient` - 替代 `httpx.AsyncClient`
+- `TracedClient` - 替代 `httpx.Client`
+- `TracedSession` - 替代 `requests.Session`
+
+**方式二：使用全局自动追踪**
+
+在应用启动时调用全局patch函数，所有原生客户端调用都会自动注入traceparent：
+
+```python
+from log_middleware import patch_requests
+
+# 在应用启动时调用一次即可
+patch_requests()
+
+# 之后所有的 requests 调用都会自动注入 traceparent
+import requests
+response = requests.get("http://localhost:8001/internal/data")
+```
+
 **service_a.py（上游服务，port 8000）**
 
 ```python
@@ -228,6 +279,113 @@ async def get_users(request):
 
 ---
 
+## 异步并发场景追踪
+
+SDK 基于 OpenTelemetry 的上下文传播机制，支持多种异步并发场景的完整链路追踪。
+
+### asyncio.create_task 追踪
+
+显式创建的子任务会自动建立独立的 child span，维持父子关系：
+
+```python
+import asyncio
+import logging
+from sanic import Sanic
+import sanic.response
+from log_middleware import SanicTraceMiddleware, setup_trace_logging
+
+app = Sanic("async-task-service")
+SanicTraceMiddleware(app, service_name="async-task-service")
+setup_trace_logging()
+
+logger = logging.getLogger("async-task-service")
+
+@app.get("/api/parallel")
+async def parallel_requests(request):
+    logger.info("开始并行请求")  # 父 span
+
+    async def fetch_user(user_id):
+        # 每个任务有独立的 span_id，parent_span_id 指向父 span
+        logger.info(f"获取用户 {user_id}")
+        await asyncio.sleep(0.1)
+        return {"id": user_id, "name": f"User{user_id}"}
+
+    # 创建多个子任务，每个任务自动建立 child span
+    tasks = [
+        asyncio.create_task(fetch_user(1)),
+        asyncio.create_task(fetch_user(2)),
+        asyncio.create_task(fetch_user(3))
+    ]
+
+    results = await asyncio.gather(*tasks)
+    logger.info("并行请求完成")
+    return sanic.response.json({"users": results})
+```
+
+**日志效果：**
+```
+[INFO] [abc123 - parent_span - ] [async-task-service] 开始并行请求
+[INFO] [abc123 - child_span_1 - parent_span] [async-task-service] 获取用户 1
+[INFO] [abc123 - child_span_2 - parent_span] [async-task-service] 获取用户 2
+[INFO] [abc123 - child_span_3 - parent_span] [async-task-service] 获取用户 3
+[INFO] [abc123 - parent_span - ] [async-task-service] 并行请求完成
+```
+
+### 线程池追踪
+
+使用 `loop.run_in_executor` 执行同步函数时，线程内的日志会自动继承当前的 OTel 上下文：
+
+```python
+import asyncio
+import logging
+from sanic import Sanic
+import sanic.response
+from log_middleware import SanicTraceMiddleware, setup_trace_logging
+
+app = Sanic("executor-service")
+SanicTraceMiddleware(app, service_name="executor-service")
+setup_trace_logging()
+
+logger = logging.getLogger("executor-service")
+
+def sync_blocking_function(user_id):
+    """同步阻塞函数，在线程池中执行"""
+    logger.info(f"在线程中处理用户 {user_id}")  # 自动携带 trace_id
+    return {"id": user_id, "processed": True}
+
+@app.get("/api/process")
+async def process_request(request):
+    logger.info("开始处理请求")  # 主协程中
+
+    loop = asyncio.get_event_loop()
+    # 将同步函数提交到线程池执行
+    result = await loop.run_in_executor(None, sync_blocking_function, 123)
+
+    logger.info("处理完成")
+    return sanic.response.json(result)
+```
+
+**日志效果：**
+```
+[INFO] [abc123 - main_span - ] [executor-service] 开始处理请求
+[INFO] [abc123 - executor_span - main_span] [executor-service] 在线程中处理用户 123
+[INFO] [abc123 - main_span - ] [executor-service] 处理完成
+```
+
+### 异步场景速查表
+
+| 场景 | trace_id | span_id | parent_span_id |
+|------|----------|---------|----------------|
+| 普通 handler 内 `logger.info()` | ✅ | ✅ | 父 span 才有 |
+| Controller → Service → Repository | ✅ 相同 | ✅ 相同 | 父 span 才有 |
+| `asyncio.create_task()` 子任务 | ✅ | 子任务独立 span_id | 指向父 span |
+| `loop.run_in_executor()` 线程池 | ✅ | 线程独立 span_id | 指向父 span |
+| `asyncio.gather()` 并发协程 | ✅ 相同 | ✅ 相同 | 父 span 才有 |
+| Sanic 流式响应回调 | ✅ | ✅ | 父 span 才有 |
+| 后台任务（无请求上下文） | 空字符串 | 空字符串 | 空字符串 |
+
+---
+
 ## 配置项
 
 通过 `TraceConfig` 自定义所有行为：
@@ -302,8 +460,13 @@ async def my_service_method():
 | `setup_trace_logging` | function | 配置日志格式，自动注入 trace 字段 |
 | `TraceConfig` | dataclass | 全局配置项 |
 | `get_tracer` | function | 获取 OTel Tracer，用于手动创建子 Span |
-| `inject_trace_headers` | function | 向 headers dict 注入 traceparent（非 aiohttp 场景） |
+| `inject_trace_headers` | function | 向 headers dict 注入 traceparent（非自动追踪场景） |
 | `TraceContextFilter` | class | 日志 Filter，可单独挂载到自定义 Handler |
+| `TracedClientSession` | class | aiohttp.ClientSession 包装类，自动注入 traceparent |
+| `TracedAsyncClient` | class | httpx.AsyncClient 包装类，自动注入 traceparent |
+| `TracedClient` | class | httpx.Client 包装类（同步），自动注入 traceparent |
+| `TracedSession` | class | requests.Session 包装类（同步），自动注入 traceparent |
+| `patch_requests` | function | 全局 patch requests 客户端，自动注入 traceparent |
 
 ---
 
