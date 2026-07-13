@@ -705,9 +705,9 @@ async def test_gather_coroutines_in_handler():
 
 async def test_create_task_inside_active_context():
     """
-    场景15: handler 内 asyncio.create_task(coro) —— 在 context attach 期间创建
+    场景15: handler 内 asyncio.create_task(coro) —— patch 前的 baseline
     原理: CPython 的 create_task 会自动 copy_context()，Task 私有 context 中含 OTel span
-    预期: 所有 Task 内的日志都有 trace_id（用户无需显式传 context）
+    预期（patch 前）: 所有 Task 内有 trace_id，但 span_id 与父 span 相同（无独立 span）
 
     这与"Group 2 test_background_task_created_after_detach"的区别：
     - 这里 create_task 在 attach 期间调用（handler 生命周期内）→ 有 trace ✅
@@ -718,15 +718,15 @@ async def test_create_task_inside_active_context():
     task_fields: list[dict] = []
 
     async def bg_worker(label):
-        asyncio.sleep(0)
+        await asyncio.sleep(0)
         logger.info(f"[bg-task:{label}] running")
         task_fields.append(capture.get_trace_fields(-1))
 
     span = tracer.start_span("POST /api/batch")
     ctx = trace.set_span_in_context(span)
     token = context_api.attach(ctx)
+    parent_sid = format(span.get_span_context().span_id, "016x")
     try:
-        # 在 handler 内正常创建 Task —— 用户完全无感知
         tasks = [asyncio.create_task(bg_worker(str(i))) for i in range(3)]
         await asyncio.gather(*tasks)
     finally:
@@ -735,50 +735,177 @@ async def test_create_task_inside_active_context():
 
     all_have_trace = all(has_trace(f) for f in task_fields)
     ids = [f["trace_id"] for f in task_fields]
+    # patch 前：Task 继承父 span，span_id 与父相同
+    all_inherit_parent_span = all(f["span_id"] == parent_sid for f in task_fields)
     fields = task_fields[0] if task_fields else {}
     report(
         "test_create_task_inside_active_context",
-        all_have_trace and len(set(ids)) == 1,
+        all_have_trace and len(set(ids)) == 1 and all_inherit_parent_span,
         fields,
-        f"3个 Task 均有相同 trace_id: {len(set(ids)) == 1 and bool(ids[0])}",
+        f"patch 前 baseline：3个 Task trace_id 相同，span_id 均继承父 span({parent_sid[:8]})",
     )
 
 
 async def test_run_in_executor_transparent_after_patch():
     """
-    场景16: SDK 全局 patch BaseEventLoop.run_in_executor 后，用户零改动
-    → 原生 `loop.run_in_executor(None, sync_fn)` 在线程内也自动有 trace_id。
+    场景16: SDK patch run_in_executor 后，线程自动获得独立 child span。
 
-    原理: patch 后自动 `contextvars.copy_context()` 快照当前 asyncio Task 的
-         ContextVar，并用 `ctx.run(fn, *args)` 在线程内恢复。
-
-    调用前需触发 patch（`run_all()` 会在 Group 6 之前调用 _patch_run_in_executor_once）
+    patch 后行为：
+    - 线程有 trace_id（来自父 span 的 trace_id，全链路不变）
+    - 线程有独立 span_id（≠ 父 span_id）
+    - 线程的 parent_span_id = 父 SERVER span 的 span_id
+    → 线程内发出的 HTTP 请求会携带线程自己的 span_id 作为 parent
     """
     _, tracer, logger, capture = make_test_env()
 
     thread_fields: dict = {}
 
     def sync_worker():
-        logger.info("[thread] 同步 LLM 调用")
+        logger.info("[thread] 同步调用")
         thread_fields.update(capture.get_trace_fields(-1))
-        return "LLM response"
+        return "done"
 
     span = tracer.start_span("POST /api/sync-llm")
     ctx = trace.set_span_in_context(span)
     token = context_api.attach(ctx)
+    parent_sid = format(span.get_span_context().span_id, "016x")
     try:
         loop = asyncio.get_event_loop()
-        # 用户完全不需要改动，直接用原生 run_in_executor
         await loop.run_in_executor(None, sync_worker)
     finally:
         span.end()
         context_api.detach(token)
 
+    has_own_span = (
+        has_trace(thread_fields)
+        and thread_fields.get("span_id") != parent_sid
+        and thread_fields.get("parent_span_id") == parent_sid
+    )
     report(
         "test_run_in_executor_transparent_after_patch",
-        has_trace(thread_fields),
+        has_own_span,
         thread_fields,
-        "patch 后：原生 loop.run_in_executor 自动继承 trace（用户零感知）",
+        f"线程有独立 span_id，parent_span_id={thread_fields.get('parent_span_id', '')[:8]} == 父 span",
+    )
+
+
+async def test_create_task_each_has_own_span():
+    """
+    场景17: _patch_create_task_once() 后，asyncio.create_task() 每个 Task 获得独立 child span。
+
+    patch 后行为：
+    - 每个 Task 有独立 span_id（≠ 父 span_id）
+    - 每个 Task 的 parent_span_id = 父 SERVER span 的 span_id
+    - 所有 Task 的 trace_id = 父 span 的 trace_id（全链路不变）
+    """
+    _, tracer, logger, capture = make_test_env()
+
+    task_fields: list[dict] = []
+
+    async def bg_worker(label):
+        await asyncio.sleep(0)
+        logger.info(f"[bg-task:{label}] running")
+        task_fields.append(capture.get_trace_fields(-1))
+
+    span = tracer.start_span("POST /api/batch")
+    ctx = trace.set_span_in_context(span)
+    token = context_api.attach(ctx)
+    parent_sid = format(span.get_span_context().span_id, "016x")
+    parent_tid = format(span.get_span_context().trace_id, "032x")
+    try:
+        tasks = [asyncio.create_task(bg_worker(str(i))) for i in range(3)]
+        await asyncio.gather(*tasks)
+    finally:
+        span.end()
+        context_api.detach(token)
+
+    trace_ids_same = all(f["trace_id"] == parent_tid for f in task_fields)
+    each_has_own_span = all(f["span_id"] != parent_sid for f in task_fields)
+    each_points_to_parent = all(f["parent_span_id"] == parent_sid for f in task_fields)
+    span_ids_unique = len({f["span_id"] for f in task_fields}) == 3
+
+    passed = trace_ids_same and each_has_own_span and each_points_to_parent and span_ids_unique
+    fields = task_fields[0] if task_fields else {}
+    report(
+        "test_create_task_each_has_own_span",
+        passed,
+        fields,
+        f"3个 Task 各有独立 span_id，parent_span_id 均指向父 span({parent_sid[:8]}): {passed}",
+    )
+
+
+async def test_subtask_http_request_carries_child_span_id():
+    """
+    场景18: create_task + aiohttp 集成 —— 子任务发出的 HTTP 请求携带子任务自己的 span_id。
+
+    链路：父 SERVER span (A) → create_task child span (B, parent=A)
+           → aiohttp 请求注入 traceparent(parent=B) → service_b parent_span_id=B
+
+    验证：TestServer 收到的 traceparent 中 parent-id = 子任务 span_id（B），而非父 span_id（A）。
+    """
+    import aiohttp
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    _, tracer, _, _ = make_test_env()
+
+    received_traceparents: list[str] = []
+
+    async def handler(request):
+        received_traceparents.append(request.headers.get("traceparent", ""))
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+
+    span = tracer.start_span("GET /api/parallel")
+    ctx = trace.set_span_in_context(span)
+    token = context_api.attach(ctx)
+    parent_sid = format(span.get_span_context().span_id, "016x")
+
+    child_span_ids: list[str] = []
+    server_url = ""
+
+    async def subtask_worker():
+        # 此时当前 span = child span（由 _patch_create_task_once 创建）
+        child_sid = format(trace.get_current_span().get_span_context().span_id, "016x")
+        child_span_ids.append(child_sid)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(server_url) as resp:
+                await resp.text()
+
+    try:
+        async with TestServer(app) as server:
+            server_url = server.make_url("/")
+            task = asyncio.create_task(subtask_worker())
+            await task
+    finally:
+        span.end()
+        context_api.detach(token)
+
+    if not received_traceparents or not child_span_ids:
+        report("test_subtask_http_request_carries_child_span_id", False,
+               {"trace_id": "", "span_id": "", "parent_span_id": ""},
+               "未收到 traceparent 或未能获取 child span_id")
+        return
+
+    tp = received_traceparents[0]
+    parts = tp.split("-")
+    child_sid = child_span_ids[0]
+
+    # traceparent 中 parent-id 应等于 child span 的 span_id，而非父 span_id
+    parent_id_in_header = parts[2] if len(parts) == 4 else ""
+    passed = (
+        parent_id_in_header == child_sid
+        and child_sid != parent_sid
+    )
+    report(
+        "test_subtask_http_request_carries_child_span_id",
+        passed,
+        {"trace_id": parts[1] if len(parts) == 4 else "",
+         "span_id": child_sid,
+         "parent_span_id": parent_sid},
+        f"traceparent.parent-id({parent_id_in_header[:8]}) == child span({child_sid[:8]}) ≠ 父({parent_sid[:8]}): {passed}",
     )
 
 
@@ -1477,6 +1604,13 @@ async def run_all():
     print("  日志 SDK  trace_id / span_id / parent_span_id  全场景测试")
     print("═" * 72)
 
+    # 为 patch 函数中的子 span 创建设置全局 OTel provider
+    # 生产环境中 SanicTraceMiddleware 通过 setup_provider() 自动完成此步
+    # 测试中各 Group 使用自己的本地 provider/tracer，不受影响
+    _global_test_provider = TracerProvider()
+    _global_test_provider.add_span_processor(SimpleSpanProcessor(InMemorySpanExporter()))
+    trace.set_tracer_provider(_global_test_provider)
+
     print("\n─── Group 1: 正常有 trace_id 的场景 ────────────────────────────────")
     await test_direct_context_attach()
     await test_nested_await_chain()
@@ -1502,13 +1636,22 @@ async def run_all():
 
     print("\n─── Group 6: handler 内并发调度（gather / create_task / 线程池）──")
     await test_gather_coroutines_in_handler()
+    # patch 前 baseline：Task 继承父 span_id，无独立 child span
     await test_create_task_inside_active_context()
-    # 触发全局 patch —— 模拟 SanicTraceMiddleware 初始化时对 run_in_executor 的 patch
-    # 之前 Group 3 test_run_in_executor_loses_context 需要"未 patch"的 baseline，
-    # 所以 patch 放在这里而非 import 时
-    from log_middleware.middleware import _patch_run_in_executor_once
+    # 应用两个 patch（模拟 SanicTraceMiddleware 初始化）
+    # Group 3 的 baseline 测试在 patch 前运行，所以 patch 推迟到此处
+    from log_middleware.middleware import (
+        _patch_create_task_once,
+        _patch_run_in_executor_once,
+        _patch_aiohttp_inject_once,
+    )
+    _patch_create_task_once()
     _patch_run_in_executor_once()
+    _patch_aiohttp_inject_once()  # subtask HTTP 集成测试需要 aiohttp 自动注入
+    # patch 后：每个子任务有独立 child span
+    await test_create_task_each_has_own_span()
     await test_run_in_executor_transparent_after_patch()
+    await test_subtask_http_request_carries_child_span_id()
 
     print("\n─── Group 7: 防御性兜底（Sanic 兼容探测 + _after_response 兜底）─")
     await test_defense_after_response_cleanup_when_no_response()

@@ -29,6 +29,7 @@ _REQUEST_TRACE: ContextVar[_TraceCleanupInfo | None] = ContextVar(
 _sanic_send_patched = False       # 是否已尝试过 patch（保证幂等，无论成功失败）
 _send_patch_active = False        # send patch 是否真正生效（探测失败时为 False）
 _run_in_executor_patched = False
+_create_task_patched = False
 _aiohttp_inject_patched = False
 _httpx_inject_patched = False
 _requests_inject_patched = False
@@ -54,19 +55,79 @@ def _patch_run_in_executor_once() -> None:
     _run_in_executor_patched = True
 
     from asyncio.base_events import BaseEventLoop
+    from opentelemetry import trace as _trace
     _orig_run_in_executor = BaseEventLoop.run_in_executor
 
     def _traced_run_in_executor(self, executor, func, *args):
-        # 快照当前 asyncio Task 的所有 ContextVar（含 OTel span）
-        # 无请求上下文时快照仍然会做，但 ctx 为空，语义等价于原生 run_in_executor
         ctx = contextvars.copy_context()
+        current_span = _trace.get_current_span()
 
-        def _wrapped(*inner_args):
-            return ctx.run(func, *inner_args)
+        if current_span.get_span_context().is_valid:
+            tracer = _trace.get_tracer("log_middleware.executor")
+            span_name = (
+                getattr(func, "__qualname__", None)
+                or getattr(func, "__name__", None)
+                or "run_in_executor"
+            )
+
+            def _wrapped(*inner_args):
+                def _with_child():
+                    with tracer.start_as_current_span(span_name):
+                        return func(*inner_args)
+                return ctx.run(_with_child)
+        else:
+            def _wrapped(*inner_args):
+                return ctx.run(func, *inner_args)
 
         return _orig_run_in_executor(self, executor, _wrapped, *args)
 
     BaseEventLoop.run_in_executor = _traced_run_in_executor
+
+
+def _patch_create_task_once() -> None:
+    """
+    对 asyncio.create_task 做一次模块级 patch，为每个显式创建的 Task 自动建立
+    child span，使子任务在日志中有独立的 span_id，parent_span_id 指向父 span。
+
+    有活跃 span 时：
+      - 包装 coroutine，在 Task 启动时以父 span 为 parent 创建 child span
+      - 子任务内发出的 HTTP 请求（aiohttp/httpx patch）会自动携带子任务的 span_id
+    无活跃 span 时：退回原生 create_task 行为。
+
+    注意：asyncio.gather(coro) 内部调用 loop.create_task()，不受此 patch 影响；
+    只有显式调用 asyncio.create_task() 才会得到独立 child span。
+    """
+    global _create_task_patched
+    if _create_task_patched:
+        return
+    _create_task_patched = True
+
+    import asyncio
+    from opentelemetry import trace as _trace
+
+    _orig_create_task = asyncio.create_task
+
+    def _traced_create_task(coro, *, name=None, **kwargs):
+        current_span = _trace.get_current_span()
+        if not current_span.get_span_context().is_valid:
+            return _orig_create_task(coro, name=name, **kwargs)
+
+        tracer = _trace.get_tracer("log_middleware.task")
+        span_name = (
+            name
+            or getattr(coro, "__qualname__", None)
+            or "async_task"
+        )
+
+        async def _wrapped_coro():
+            # CPython 的 create_task 已自动 copy_context，父 span 在 ContextVar 中
+            # start_as_current_span 以父 span 为 parent 创建 child span，结束时自动 end
+            with tracer.start_as_current_span(span_name):
+                return await coro
+
+        return _orig_create_task(_wrapped_coro(), name=name, **kwargs)
+
+    asyncio.create_task = _traced_create_task
 
 
 def _patch_aiohttp_inject_once() -> None:
@@ -264,6 +325,8 @@ class SanicTraceMiddleware:
         _patch_sanic_send_once()
         # 同时 patch loop.run_in_executor：线程池自动继承当前 asyncio Task 的 OTel 上下文
         _patch_run_in_executor_once()
+        # patch asyncio.create_task / run_in_executor：子任务自动建立独立 child span
+        _patch_create_task_once()
         # patch aiohttp / httpx：自动注入 traceparent，不创建中间 CLIENT span
         _patch_aiohttp_inject_once()
         _patch_httpx_inject_once()
