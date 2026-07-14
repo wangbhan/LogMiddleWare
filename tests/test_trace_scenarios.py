@@ -1596,6 +1596,450 @@ async def test_requests_no_span_no_traceparent():
 
 
 # ══════════════════════════════════════════════
+# Group 11: 下游服务接收 traceparent（跨服务 W3C 传播）
+# ══════════════════════════════════════════════
+
+class _MockSanicRequest:
+    """轻量模拟 Sanic Request，仅提供 headers 属性供 extract_trace_context 使用。"""
+    def __init__(self, headers: dict):
+        self.headers = headers
+
+
+async def test_downstream_extracts_traceparent_creates_linked_span():
+    """
+    场景19: 下游服务收到带 traceparent 头的入站请求，通过 extract_trace_context()
+    提取上游上下文，创建的 SERVER span 自动与上游链路关联。
+
+    链路：
+      service A SERVER span (trace_id=T, span_id=A)
+        → 注入 traceparent: 00-T-A-01
+        → service B 收到请求
+        → extract_trace_context() 提取 (T, A)
+        → service B SERVER span (trace_id=T, parent_span_id=A)
+
+    预期：
+      - log.trace_id       == upstream trace_id（全链路 trace_id 不变）
+      - log.parent_span_id == upstream span_id（父子关系正确）
+      - log.span_id        != upstream span_id（service B 有自己的 span_id）
+    """
+    from log_middleware.propagation import extract_trace_context
+
+    _, tracer, logger, capture = make_test_env()
+
+    upstream_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+    upstream_span_id  = "00f067aa0ba902b7"
+    traceparent       = f"00-{upstream_trace_id}-{upstream_span_id}-01"
+
+    mock_request = _MockSanicRequest({"traceparent": traceparent})
+
+    parent_ctx = extract_trace_context(mock_request)
+    span = tracer.start_span("GET /api/data", context=parent_ctx)
+    ctx  = trace.set_span_in_context(span)
+    token = context_api.attach(ctx)
+    try:
+        logger.info("service B 处理请求")
+    finally:
+        span.end()
+        context_api.detach(token)
+
+    fields = capture.get_trace_fields()
+    b_span_id = format(span.get_span_context().span_id, "016x")
+
+    passed = (
+        fields["trace_id"]       == upstream_trace_id
+        and fields["parent_span_id"] == upstream_span_id
+        and fields["span_id"]        == b_span_id
+        and b_span_id                != upstream_span_id
+    )
+    report(
+        "test_downstream_extracts_traceparent_creates_linked_span",
+        passed,
+        fields,
+        f"trace_id 不变: {fields['trace_id'][:8]}, "
+        f"parent_span_id={fields['parent_span_id'][:8]} == 上游 span_id: {passed}",
+    )
+
+
+async def test_downstream_no_traceparent_creates_root_span():
+    """
+    场景20: 下游服务收到的请求不含 traceparent（直接访问，无上游），
+    extract_trace_context() 返回空上下文，创建的 span 是全新根 span。
+
+    预期：
+      - log.trace_id       非空（有自己的 trace_id）
+      - log.parent_span_id 为空（无父 span）
+    """
+    from log_middleware.propagation import extract_trace_context
+
+    _, tracer, logger, capture = make_test_env()
+
+    mock_request = _MockSanicRequest({})  # 无 traceparent
+
+    parent_ctx = extract_trace_context(mock_request)
+    span = tracer.start_span("GET /api/health", context=parent_ctx)
+    ctx  = trace.set_span_in_context(span)
+    token = context_api.attach(ctx)
+    try:
+        logger.info("无上游的直接请求")
+    finally:
+        span.end()
+        context_api.detach(token)
+
+    fields = capture.get_trace_fields()
+    passed = bool(fields["trace_id"]) and not fields["parent_span_id"]
+    report(
+        "test_downstream_no_traceparent_creates_root_span",
+        passed,
+        fields,
+        f"无 traceparent → 独立根 span，trace_id={fields['trace_id'][:8]}, "
+        f"parent_span_id 为空: {passed}",
+    )
+
+
+async def test_full_end_to_end_inject_and_extract():
+    """
+    场景21: 完整端到端 —— service A 注入 traceparent，service B 提取并创建 child span。
+
+    流程：
+      1. service A 建立 SERVER span (trace_id=T, span_id=A)
+      2. inject_trace_headers({}) → 得到 {"traceparent": "00-T-A-01"}
+      3. 模拟 HTTP 请求到 service B（headers 携带 traceparent）
+      4. service B extract_trace_context(request) → 提取 (T, A)
+      5. service B 建立 SERVER span (trace_id=T, span_id=B, parent_span_id=A)
+
+    预期：B 的 trace_id == A 的 trace_id，B 的 parent_span_id == A 的 span_id
+    """
+    from log_middleware.propagation import extract_trace_context, inject_trace_headers
+
+    _, tracer_a, _, _ = make_test_env()
+    _, tracer_b, logger_b, capture_b = make_test_env()
+
+    # ── service A ──
+    span_a = tracer_a.start_span("POST /api/order")
+    ctx_a  = trace.set_span_in_context(span_a)
+    token_a = context_api.attach(ctx_a)
+
+    a_trace_id = format(span_a.get_span_context().trace_id, "032x")
+    a_span_id  = format(span_a.get_span_context().span_id,  "016x")
+
+    # 注入 → 模拟 HTTP 请求头
+    outbound_headers = inject_trace_headers({})
+
+    span_a.end()
+    context_api.detach(token_a)
+
+    # ── service B ──
+    mock_request = _MockSanicRequest(outbound_headers)
+    parent_ctx_b = extract_trace_context(mock_request)
+    span_b  = tracer_b.start_span("POST /api/order", context=parent_ctx_b)
+    ctx_b   = trace.set_span_in_context(span_b)
+    token_b = context_api.attach(ctx_b)
+    try:
+        logger_b.info("service B 处理订单请求")
+    finally:
+        span_b.end()
+        context_api.detach(token_b)
+
+    fields_b   = capture_b.get_trace_fields()
+    b_span_id  = format(span_b.get_span_context().span_id, "016x")
+
+    passed = (
+        fields_b["trace_id"]       == a_trace_id
+        and fields_b["parent_span_id"] == a_span_id
+        and b_span_id                  != a_span_id
+    )
+    report(
+        "test_full_end_to_end_inject_and_extract",
+        passed,
+        fields_b,
+        f"A.trace_id={a_trace_id[:8]} B.trace_id={fields_b['trace_id'][:8]} 相同: {fields_b['trace_id'] == a_trace_id}; "
+        f"B.parent_span_id={fields_b['parent_span_id'][:8]} == A.span_id={a_span_id[:8]}: {fields_b['parent_span_id'] == a_span_id}",
+    )
+
+
+async def test_aiohttp_inject_downstream_extract_full_chain():
+    """
+    场景22: 全链路集成 —— aiohttp 自动注入 + 下游 extract_trace_context 提取。
+
+    使用 aiohttp TestServer 真实发送 HTTP 请求，服务端读取 traceparent 头
+    并通过 extract_trace_context 创建 child span，验证链路完整传递。
+
+    链路：
+      service A SERVER span (T, A)
+        → aiohttp patch 自动注入 traceparent
+        → HTTP GET → TestServer
+        → handler 调用 extract_trace_context
+        → service B SERVER span (T, B, parent=A)
+    """
+    import aiohttp
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_aiohttp_inject_once
+    from log_middleware.propagation import extract_trace_context
+
+    saved_patched = mw_mod._aiohttp_inject_patched
+    saved_init    = aiohttp.ClientSession.__init__
+    mw_mod._aiohttp_inject_patched = False
+
+    _, tracer_a, _, _ = make_test_env()
+    _, tracer_b, logger_b, capture_b = make_test_env()
+
+    server_fields: dict = {}
+
+    async def service_b_handler(request):
+        # 提取上游上下文
+        parent_ctx = extract_trace_context(request)
+        span_b = tracer_b.start_span("GET /", context=parent_ctx)
+        ctx_b  = trace.set_span_in_context(span_b)
+        token  = context_api.attach(ctx_b)
+        try:
+            logger_b.info("service B handler")
+            server_fields.update(capture_b.get_trace_fields(-1))
+        finally:
+            span_b.end()
+            context_api.detach(token)
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", service_b_handler)
+
+    try:
+        _patch_aiohttp_inject_once()
+
+        with tracer_a.start_as_current_span("GET /api/remote") as span_a:
+            a_trace_id = format(span_a.get_span_context().trace_id, "032x")
+            a_span_id  = format(span_a.get_span_context().span_id,  "016x")
+
+            async with TestServer(app) as server:
+                async with aiohttp.ClientSession() as session:
+                    await session.get(server.make_url("/"))
+
+        passed = (
+            server_fields.get("trace_id")       == a_trace_id
+            and server_fields.get("parent_span_id") == a_span_id
+        )
+        report(
+            "test_aiohttp_inject_downstream_extract_full_chain",
+            passed,
+            server_fields,
+            f"全链路：A.trace_id={a_trace_id[:8]}, B.parent_span_id="
+            f"{server_fields.get('parent_span_id', '')[:8]} == A.span_id={a_span_id[:8]}: {passed}",
+        )
+    finally:
+        mw_mod._aiohttp_inject_patched = saved_patched
+        aiohttp.ClientSession.__init__ = saved_init
+
+
+async def test_httpx_async_inject_downstream_extract_full_chain():
+    """
+    场景23: httpx.AsyncClient 自动注入 traceparent + 下游 extract_trace_context 提取。
+
+    使用 httpx.MockTransport 捕获出站请求头，再构造 mock 请求交给下游 SDK 提取，
+    验证跨服务链路：A.trace_id == B.trace_id，B.parent_span_id == A.span_id。
+    """
+    import httpx
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_httpx_inject_once
+    from log_middleware.propagation import extract_trace_context
+
+    saved_patched    = mw_mod._httpx_inject_patched
+    saved_async_init = httpx.AsyncClient.__init__
+    mw_mod._httpx_inject_patched = False
+
+    _, tracer_a, _, _         = make_test_env()
+    _, tracer_b, logger_b, capture_b = make_test_env()
+
+    captured_headers: dict = {}
+
+    def mock_transport(request):
+        captured_headers.update(dict(request.headers))
+        return httpx.Response(200)
+
+    try:
+        _patch_httpx_inject_once()
+
+        with tracer_a.start_as_current_span("POST /api/order") as span_a:
+            a_trace_id = format(span_a.get_span_context().trace_id, "032x")
+            a_span_id  = format(span_a.get_span_context().span_id,  "016x")
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(mock_transport)
+            ) as client:
+                await client.get("http://testserver/")
+
+        # 下游提取
+        mock_req  = _MockSanicRequest(captured_headers)
+        parent_ctx = extract_trace_context(mock_req)
+        span_b    = tracer_b.start_span("GET /", context=parent_ctx)
+        ctx_b     = trace.set_span_in_context(span_b)
+        token_b   = context_api.attach(ctx_b)
+        try:
+            logger_b.info("service B 处理请求 (httpx async)")
+        finally:
+            span_b.end()
+            context_api.detach(token_b)
+
+        fields_b = capture_b.get_trace_fields()
+        passed = (
+            fields_b["trace_id"]       == a_trace_id
+            and fields_b["parent_span_id"] == a_span_id
+        )
+        report(
+            "test_httpx_async_inject_downstream_extract_full_chain",
+            passed,
+            fields_b,
+            f"全链路(httpx async)：A.trace_id={a_trace_id[:8]}, "
+            f"B.parent_span_id={fields_b.get('parent_span_id','')[:8]} == A.span_id={a_span_id[:8]}: {passed}",
+        )
+    finally:
+        mw_mod._httpx_inject_patched = saved_patched
+        httpx.AsyncClient.__init__ = saved_async_init
+
+
+async def test_httpx_sync_inject_downstream_extract_full_chain():
+    """
+    场景24: httpx.Client（同步）自动注入 traceparent + 下游 extract_trace_context 提取。
+
+    与场景23 逻辑相同，验证同步 httpx.Client 的完整跨服务链路。
+    """
+    import httpx
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_httpx_inject_once
+    from log_middleware.propagation import extract_trace_context
+
+    saved_patched   = mw_mod._httpx_inject_patched
+    saved_sync_init = httpx.Client.__init__
+    mw_mod._httpx_inject_patched = False
+
+    _, tracer_a, _, _         = make_test_env()
+    _, tracer_b, logger_b, capture_b = make_test_env()
+
+    captured_headers: dict = {}
+
+    def mock_transport(request):
+        captured_headers.update(dict(request.headers))
+        return httpx.Response(200)
+
+    try:
+        _patch_httpx_inject_once()
+
+        with tracer_a.start_as_current_span("POST /api/order") as span_a:
+            a_trace_id = format(span_a.get_span_context().trace_id, "032x")
+            a_span_id  = format(span_a.get_span_context().span_id,  "016x")
+
+            with httpx.Client(transport=httpx.MockTransport(mock_transport)) as client:
+                client.get("http://testserver/")
+
+        # 下游提取
+        mock_req   = _MockSanicRequest(captured_headers)
+        parent_ctx = extract_trace_context(mock_req)
+        span_b     = tracer_b.start_span("GET /", context=parent_ctx)
+        ctx_b      = trace.set_span_in_context(span_b)
+        token_b    = context_api.attach(ctx_b)
+        try:
+            logger_b.info("service B 处理请求 (httpx sync)")
+        finally:
+            span_b.end()
+            context_api.detach(token_b)
+
+        fields_b = capture_b.get_trace_fields()
+        passed = (
+            fields_b["trace_id"]       == a_trace_id
+            and fields_b["parent_span_id"] == a_span_id
+        )
+        report(
+            "test_httpx_sync_inject_downstream_extract_full_chain",
+            passed,
+            fields_b,
+            f"全链路(httpx sync)：A.trace_id={a_trace_id[:8]}, "
+            f"B.parent_span_id={fields_b.get('parent_span_id','')[:8]} == A.span_id={a_span_id[:8]}: {passed}",
+        )
+    finally:
+        mw_mod._httpx_inject_patched = saved_patched
+        httpx.Client.__init__ = saved_sync_init
+
+
+async def test_requests_inject_downstream_extract_full_chain():
+    """
+    场景25: requests.Session 自动注入 traceparent + 下游 extract_trace_context 提取。
+
+    mock HTTPAdapter.send 捕获 PreparedRequest.headers（注入后），
+    构造 mock 请求交给下游 SDK 提取，验证完整跨服务链路。
+    """
+    import requests
+    import requests.adapters
+    from unittest.mock import MagicMock, patch as mock_patch
+    import log_middleware.middleware as mw_mod
+    from log_middleware.middleware import _patch_requests_inject_once
+    from log_middleware.propagation import extract_trace_context
+
+    saved_patched = mw_mod._requests_inject_patched
+    saved_send    = requests.Session.send
+    mw_mod._requests_inject_patched = False
+
+    _, tracer_a, _, _         = make_test_env()
+    _, tracer_b, logger_b, capture_b = make_test_env()
+
+    captured_headers: dict = {}
+
+    mock_response = MagicMock()
+    mock_response.status_code  = 200
+    mock_response.headers      = requests.structures.CaseInsensitiveDict()
+    mock_response.cookies      = requests.cookies.RequestsCookieJar()
+    mock_response.history      = []
+    mock_response.url          = "http://testserver/"
+    mock_response.encoding     = "utf-8"
+    mock_response.raw          = MagicMock()
+    mock_response.is_redirect  = False
+    mock_response.content      = b""
+
+    def fake_adapter_send(self, request, **kwargs):
+        captured_headers.update(dict(request.headers))
+        return mock_response
+
+    try:
+        _patch_requests_inject_once()
+
+        with tracer_a.start_as_current_span("POST /api/order") as span_a:
+            a_trace_id = format(span_a.get_span_context().trace_id, "032x")
+            a_span_id  = format(span_a.get_span_context().span_id,  "016x")
+
+            with mock_patch.object(
+                requests.adapters.HTTPAdapter, "send", fake_adapter_send
+            ):
+                requests.Session().get("http://testserver/")
+
+        # 下游提取
+        mock_req   = _MockSanicRequest(captured_headers)
+        parent_ctx = extract_trace_context(mock_req)
+        span_b     = tracer_b.start_span("GET /", context=parent_ctx)
+        ctx_b      = trace.set_span_in_context(span_b)
+        token_b    = context_api.attach(ctx_b)
+        try:
+            logger_b.info("service B 处理请求 (requests)")
+        finally:
+            span_b.end()
+            context_api.detach(token_b)
+
+        fields_b = capture_b.get_trace_fields()
+        passed = (
+            fields_b["trace_id"]       == a_trace_id
+            and fields_b["parent_span_id"] == a_span_id
+        )
+        report(
+            "test_requests_inject_downstream_extract_full_chain",
+            passed,
+            fields_b,
+            f"全链路(requests)：A.trace_id={a_trace_id[:8]}, "
+            f"B.parent_span_id={fields_b.get('parent_span_id','')[:8]} == A.span_id={a_span_id[:8]}: {passed}",
+        )
+    finally:
+        mw_mod._requests_inject_patched = saved_patched
+        requests.Session.send = saved_send
+
+
+# ══════════════════════════════════════════════
 # 测试运行器
 # ══════════════════════════════════════════════
 
@@ -1675,6 +2119,15 @@ async def run_all():
     await test_requests_patch_idempotent()
     await test_requests_no_span_no_traceparent()
 
+    print("\n─── Group 11: 下游服务接收 traceparent（跨服务 W3C 传播）────")
+    await test_downstream_extracts_traceparent_creates_linked_span()
+    await test_downstream_no_traceparent_creates_root_span()
+    await test_full_end_to_end_inject_and_extract()
+    await test_aiohttp_inject_downstream_extract_full_chain()
+    await test_httpx_async_inject_downstream_extract_full_chain()
+    await test_httpx_sync_inject_downstream_extract_full_chain()
+    await test_requests_inject_downstream_extract_full_chain()
+
     # ── 汇总 ──
     print("\n" + "═" * 72)
     passed = sum(1 for _, s in RESULTS if s == "✅")
@@ -1713,6 +2166,17 @@ async def run_all():
     print("  │  15.  handler 内 asyncio.create_task(coro) → 自动 copy_context() 携带 span")
     print("  │  16.  全局 patch BaseEventLoop.run_in_executor → 原生调用自动携带 trace")
     print("  │       （patch 后用户无需改 loop.run_in_executor 的任何代码）")
+    print("  ├─────────────────────────────────────────────────────────────────")
+    print("  │ 下游服务接收 traceparent（跨服务 W3C 传播）：")
+    print("  │  19.  extract_trace_context(request) 提取上游 traceparent")
+    print("  │       → 下游 span.trace_id == 上游 trace_id（全链路一致）")
+    print("  │       → 下游 span.parent_span_id == 上游 span_id（父子关系正确）")
+    print("  │  20.  无 traceparent 头 → 创建独立根 span，parent_span_id 为空")
+    print("  │  21.  inject_trace_headers({}) → 下游 extract_trace_context → 完整端到端贯通")
+    print("  │  22.  aiohttp patch 自动注入 → TestServer 用 extract_trace_context 提取 → 链路闭环")
+    print("  │  23.  httpx.AsyncClient patch 自动注入 → 下游 extract_trace_context 提取 → 链路闭环")
+    print("  │  24.  httpx.Client（同步）patch 自动注入 → 下游 extract_trace_context 提取 → 链路闭环")
+    print("  │  25.  requests.Session patch 自动注入 → 下游 extract_trace_context 提取 → 链路闭环")
     print("  └─────────────────────────────────────────────────────────────────")
 
     if passed < total:
