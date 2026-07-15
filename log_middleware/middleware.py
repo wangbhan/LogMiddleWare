@@ -7,6 +7,7 @@ from opentelemetry import trace, context as context_api
 from opentelemetry.trace import SpanKind, StatusCode
 
 from .config import TraceConfig
+from .logging_integration import _configure_sanic_loggers
 from .provider import setup_provider
 from .propagation import extract_trace_context
 
@@ -312,6 +313,9 @@ class SanicTraceMiddleware:
 
         self._provider = setup_provider(config)
         self._tracer = trace.get_tracer(__name__)
+
+        if config.auto_configure_sanic_loggers:
+            _configure_sanic_loggers(config)
 
         app.register_middleware(self._before_request, "request")
         app.register_middleware(self._after_response, "response")

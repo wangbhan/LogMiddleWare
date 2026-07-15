@@ -18,4 +18,5 @@ class TraceConfig:
         "[%(name)s] %(message)s"
     )
     log_level: int = 10  # logging.DEBUG
+    auto_configure_sanic_loggers: bool = True  # 自动接管 sanic.* loggers，消除双重日志输出
     baggage_keys: list[str] = field(default_factory=list)  # 第二阶段启用，需透传的业务字段名，如 ["user_id", "tenant_id"]
