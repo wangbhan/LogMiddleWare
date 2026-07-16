@@ -17,6 +17,7 @@
 - **日志落盘**：支持将带 trace 字段的日志文本写入文件，内置按大小自动轮转，目录不存在时自动创建
 - **自定义 Resource**：支持自定义 Span 的 resource 属性（服务版本、环境、自定义标签等）
 - **可配置导出**：支持控制台、文件、不导出等多种 Span 导出方式
+- **Sanic 日志统一接管**：使用 `from sanic.log import logger` 记录的日志自动纳入 SDK 格式，无重复输出，含 trace_id
 - **零值日志优化**：自动将启动服务时的零值trace转换为空字符串，配合Filebeat实现ES存储优化
 
 ---
@@ -71,6 +72,36 @@ if __name__ == "__main__":
 **日志输出：**
 ```
 [2026-07-03 16:34:37,493] INFO [7b2ae787... - 4ed03c7a... - ] [my-service] 处理请求
+```
+
+---
+
+## 使用 sanic.log.logger
+
+SDK 会自动接管 Sanic 框架自身的 logger（`sanic.root`、`sanic.access`、`sanic.server` 等），无需任何额外配置。`SanicTraceMiddleware` 初始化时自动移除 Sanic 的原生格式 handler，使框架日志统一经 root logger 的 SDK handler 输出。
+
+```python
+from sanic.log import logger as sanic_logger
+
+@app.get("/api/hello")
+async def hello(request):
+    sanic_logger.info("使用 sanic.log.logger")  # 自动包含 trace_id，无重复输出
+    return sanic.response.json({"message": "hello"})
+```
+
+**输出效果（请求处理期间）：**
+```
+[2026-07-15 13:54:05,774] INFO [9239a2bc... - 2e48d98b... - ] [sanic.root] 使用 sanic.log.logger
+```
+
+**访问日志**（`sanic.access`）也会以 SDK 格式输出，包含请求信息：
+```
+[2026-07-15 13:54:05,775] INFO [ -  - ] [sanic.access] 127.0.0.1:51785 GET http://localhost:8765/api/hello 200 21 1.0ms
+```
+
+若需保留 Sanic 原生格式（会产生重复输出，不推荐），可关闭此行为：
+```python
+config = TraceConfig(auto_configure_sanic_loggers=False)
 ```
 
 ---
@@ -426,6 +457,10 @@ config = TraceConfig(
 
     # 日志级别（默认 logging.DEBUG）
     log_level=20,  # logging.INFO
+
+    # 自动接管 sanic.* loggers（默认 True，消除 Sanic 原生格式重复输出）
+    # 设为 False 可保留 Sanic 原生格式，但会产生双重日志输出
+    auto_configure_sanic_loggers=True,
 )
 
 SanicTraceMiddleware(app, service_name="my-service", config=config)
