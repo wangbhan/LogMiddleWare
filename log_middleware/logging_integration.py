@@ -37,67 +37,6 @@ class TraceContextFilter(logging.Filter):
         return True
 
 
-class SanicAccessFilter(logging.Filter):
-    """将 sanic.access 的 extra 字段重组为 record.msg，使其能被通用 SDK formatter 渲染。
-
-    sanic.access logger 的 msg 始终为空字符串，实际内容在 extra（host/request/status/byte/duration）中。
-    此 Filter 在 record 传播到 root logger 前原地改写 msg，无需单独的 formatter 或 handler。
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if not record.getMessage():
-            host = getattr(record, "host", "-")
-            request = getattr(record, "request", "-")
-            status = getattr(record, "status", "-")
-            byte = getattr(record, "byte", "-")
-            duration = getattr(record, "duration", "")
-            record.msg = f"{host} {request} {status} {byte} {duration}".strip()
-            record.args = ()
-        return True
-
-
-_SANIC_LOGGER_NAMES = (
-    "sanic.root",
-    "sanic.error",
-    "sanic.access",
-    "sanic.server",
-    "sanic.websockets",
-)
-
-
-def _configure_sanic_loggers(config: TraceConfig) -> None:
-    """清理 sanic.* loggers 的 Sanic 原生 handlers，使日志统一流经 root logger 的 SDK handler。
-
-    策略：
-    1. 移除 Sanic 通过 dictConfig 安装的 AutoFormatter handlers
-    2. 保留 propagate=True，让 sanic.* 日志传播到 root logger（SDK handler 统一输出）
-    3. 对 sanic.access 额外挂 SanicAccessFilter，提前改写空 message 为可读访问信息
-    sanic.* loggers 本身不挂任何 handler，root logger 的单一 SDK handler 处理所有输出。
-
-    幂等：SanicAccessFilter 已存在时跳过，安全多次调用。
-    """
-    try:
-        from sanic.logging.formatter import AutoFormatter
-    except ImportError:
-        return
-
-    for name in _SANIC_LOGGER_NAMES:
-        lg = logging.getLogger(name)
-
-        # 移除 Sanic 原生 handlers（识别特征：formatter 是 AutoFormatter 实例）
-        for h in list(lg.handlers):
-            if isinstance(h.formatter, AutoFormatter):
-                lg.removeHandler(h)
-
-        # sanic.access 挂 Filter 改写 msg（不挂 handler，由 root logger 统一输出）
-        if name == "sanic.access":
-            if not any(isinstance(f, SanicAccessFilter) for f in lg.filters):
-                lg.addFilter(SanicAccessFilter())
-
-        # 确保传播到 root logger（dictConfig 可能已改过，显式重置）
-        lg.propagate = True
-
-
 def setup_trace_logging(
     config: TraceConfig | None = None,
     logger_names: list[str] | None = None,
